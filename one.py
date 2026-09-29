@@ -81,6 +81,7 @@ async def update_status_card(
         eta_str = "Calculating..."
 
     filled_blocks = int(percentage // 10)
+
     progress_bar = (
         "▓" * filled_blocks +
         "░" * (10 - filled_blocks)
@@ -125,9 +126,43 @@ async def fetch_pwwp_data(
                     json=data
                 ) as response:
 
-                    if response.status >= 400:
+                    response_body = await response.text()
 
-                        response_body = await response.text()
+                    logging.info(
+                        "PWWP API | method=%s | status=%s | endpoint=%s",
+                        method,
+                        response.status,
+                        url
+                    )
+
+                    # ---------------------------------
+                    # AUTHORIZATION ERROR
+                    # ---------------------------------
+
+                    if response.status == 401:
+
+                        logging.error(
+                            "PWWP AUTH FAILED | endpoint=%s",
+                            url
+                        )
+
+                        logging.error(
+                            "PWWP AUTH RESPONSE | %s",
+                            response_body[:1000]
+                        )
+
+                        # 401 ko retry nahi karna.
+                        return {
+                            "_auth_error": True,
+                            "_status": 401,
+                            "_response": response_body
+                        }
+
+                    # ---------------------------------
+                    # OTHER HTTP ERRORS
+                    # ---------------------------------
+
+                    if response.status >= 400:
 
                         logging.error(
                             "PWWP API ERROR | attempt=%s | status=%s | endpoint=%s",
@@ -141,22 +176,20 @@ async def fetch_pwwp_data(
                             response_body[:1000]
                         )
 
-                        if response.status == 401:
-                            logging.error(
-                                "PWWP AUTH FAILED: Access token was rejected."
-                            )
-
                         if attempt < 2:
                             await asyncio.sleep(2 ** attempt)
 
                         continue
 
+                    # ---------------------------------
+                    # SUCCESS JSON
+                    # ---------------------------------
+
                     try:
-                        return await response.json()
 
-                    except Exception:
+                        return json.loads(response_body)
 
-                        response_body = await response.text()
+                    except json.JSONDecodeError:
 
                         logging.error(
                             "PWWP INVALID JSON | endpoint=%s | response=%s",
@@ -166,13 +199,21 @@ async def fetch_pwwp_data(
 
                         return None
 
+            except asyncio.TimeoutError:
+
+                logging.error(
+                    "PWWP TIMEOUT | attempt=%s | endpoint=%s",
+                    attempt + 1,
+                    url
+                )
+
             except aiohttp.ClientError as e:
 
                 logging.error(
                     "PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s",
                     attempt + 1,
                     url,
-                    e
+                    str(e)
                 )
 
             except Exception:
@@ -211,7 +252,12 @@ async def process_pwwp_chapter_content(
 
     content = []
 
-    if data and data.get("success") and data.get("data"):
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
 
         item = data["data"]
         topic = item.get("topic", "")
@@ -240,6 +286,7 @@ async def process_pwwp_chapter_content(
                         )
 
                         if u and not u.endswith(".pdf"):
+
                             content.append(
                                 f"{hw_topic}:{u}"
                             )
@@ -258,6 +305,7 @@ async def process_pwwp_chapter_content(
                     )
 
                     if u:
+
                         content.append(
                             f"{hw_topic}:{u}"
                         )
@@ -301,7 +349,12 @@ async def fetch_pwwp_all_schedule(
             params=params
         )
 
-        if data and data.get("success") and data.get("data"):
+        if (
+            data
+            and not data.get("_auth_error")
+            and data.get("success")
+            and data.get("data")
+        ):
 
             for item in data["data"]:
 
@@ -317,6 +370,7 @@ async def fetch_pwwp_all_schedule(
                     )
 
                     if direct_url:
+
                         item["_pre_extracted_url"] = direct_url
 
                 all_schedules.append(item)
@@ -415,10 +469,12 @@ async def process_pwwp_chapters(
     for res in results:
 
         if isinstance(res, Exception):
+
             logging.error(
                 "Chapter content error: %s",
                 res
             )
+
             continue
 
         for c_type, c_list in res.items():
@@ -459,7 +515,11 @@ async def get_pwwp_all_chapters(
             params=params
         )
 
-        if data and data.get("data"):
+        if (
+            data
+            and not data.get("_auth_error")
+            and data.get("data")
+        ):
 
             chapters.extend(
                 data["data"]
@@ -533,10 +593,12 @@ async def process_pwwp_subject(
     ):
 
         if isinstance(content_map, Exception):
+
             logging.error(
                 "Chapter failed: %s",
                 content_map
             )
+
             continue
 
         ch_name = (
@@ -610,7 +672,12 @@ async def get_pwwp_todays_schedule_content_details(
 
     content = []
 
-    if data and data.get("success") and data.get("data"):
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
 
         item = data["data"]
 
@@ -699,7 +766,12 @@ async def get_pwwp_all_todays_schedule_content(
 
     all_content = []
 
-    if data and data.get("success") and data.get("data"):
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
 
         schedules = data["data"]
         total_items = len(schedules)
@@ -782,9 +854,9 @@ async def process_pwwp(
 
             access_token = None
 
-            # -------------------------------
+            # ---------------------------------
             # PHONE LOGIN
-            # -------------------------------
+            # ---------------------------------
 
             if raw_input.isdigit() and len(raw_input) == 10:
 
@@ -902,18 +974,16 @@ async def process_pwwp(
                     "Token generated."
                 )
 
-            # -------------------------------
+            # ---------------------------------
             # TOKEN LOGIN
-            # -------------------------------
+            # ---------------------------------
 
             else:
 
                 access_token = raw_input.strip()
 
-                # Prevent "Bearer Bearer TOKEN"
-                if access_token.lower().startswith(
-                    "bearer "
-                ):
+                if access_token.lower().startswith("bearer "):
+
                     access_token = access_token[7:].strip()
 
             if not access_token:
@@ -932,14 +1002,12 @@ async def process_pwwp(
 
             auth_headers = {
                 **api_headers,
-                "authorization": (
-                    f"Bearer {access_token}"
-                )
+                "authorization": f"Bearer {access_token}"
             }
 
-            # -------------------------------
+            # ---------------------------------
             # BATCH SEARCH
-            # -------------------------------
+            # ---------------------------------
 
             batch_search = await prompt_user(
                 bot,
@@ -962,18 +1030,42 @@ async def process_pwwp(
                 }
             )
 
-            courses = (
-                courses_res.get("data", [])
-                if courses_res
-                else []
+            # ---------------------------------
+            # AUTH ERROR — DO NOT CALL IT
+            # "NO BATCHES"
+            # ---------------------------------
+
+            if courses_res and courses_res.get("_auth_error"):
+
+                await editable.edit(
+                    "🔐 **Authorization Failed ❌**\n\n"
+                    "PW rejected the supplied authorized "
+                    "access token with **HTTP 401**.\n\n"
+                    "Please use a currently valid authorized token."
+                )
+
+                return
+
+            if courses_res is None:
+
+                await editable.edit(
+                    "❌ **PW API Request Failed**\n\n"
+                    "The server did not return a valid response."
+                )
+
+                return
+
+            courses = courses_res.get(
+                "data",
+                []
             )
 
             if not courses:
 
                 await editable.edit(
-                    "**No Batches Found! ❌**\n\n"
-                    "**Check whether your authorized "
-                    "access token is valid and active.**"
+                    "❌ **No Batches Found!**\n\n"
+                    "Authorization succeeded, but no matching "
+                    "batch was returned for this search."
                 )
 
                 return
@@ -1030,9 +1122,9 @@ async def process_pwwp(
                 .replace("|", "-")
             )
 
-            # -------------------------------
+            # ---------------------------------
             # MODE
-            # -------------------------------
+            # ---------------------------------
 
             mode = await prompt_user(
                 bot,
@@ -1056,9 +1148,9 @@ async def process_pwwp(
 
             start_time = time.time()
 
-            # -------------------------------
+            # ---------------------------------
             # FULL BATCH
-            # -------------------------------
+            # ---------------------------------
 
             if mode == "1":
 
@@ -1077,6 +1169,16 @@ async def process_pwwp(
                     headers=auth_headers
                 )
 
+                if b_details and b_details.get("_auth_error"):
+
+                    await editable.edit(
+                        "🔐 **Authorization Failed ❌**\n\n"
+                        "PW rejected the authorized token "
+                        "while fetching batch details."
+                    )
+
+                    return
+
                 subjects = (
                     b_details
                     .get("data", {})
@@ -1093,9 +1195,7 @@ async def process_pwwp(
 
                 all_urls = {}
 
-                zip_path = (
-                    f"{clean_name}.zip"
-                )
+                zip_path = f"{clean_name}.zip"
 
                 with zipfile.ZipFile(
                     zip_path,
@@ -1103,9 +1203,7 @@ async def process_pwwp(
                     zipfile.ZIP_DEFLATED
                 ) as zipf:
 
-                    for idx, sub in enumerate(
-                        subjects
-                    ):
+                    for idx, sub in enumerate(subjects):
 
                         sub_name = sub.get(
                             "subject",
@@ -1141,9 +1239,7 @@ async def process_pwwp(
                     current=total_subjects,
                     total=total_subjects,
                     start_time=start_time,
-                    activity=(
-                        "Compiling final files..."
-                    )
+                    activity="Compiling final files..."
                 )
 
                 with open(
@@ -1174,9 +1270,9 @@ async def process_pwwp(
                                 + "\n"
                             )
 
-            # -------------------------------
+            # ---------------------------------
             # TODAY'S CLASS
-            # -------------------------------
+            # ---------------------------------
 
             else:
 
@@ -1196,13 +1292,11 @@ async def process_pwwp(
                     encoding="utf-8"
                 ) as f:
 
-                    f.writelines(
-                        today_data
-                    )
+                    f.writelines(today_data)
 
-            # -------------------------------
+            # ---------------------------------
             # UPLOAD
-            # -------------------------------
+            # ---------------------------------
 
             time_taken = format_time(
                 time.time() - start_time
@@ -1226,9 +1320,7 @@ async def process_pwwp(
                 "json"
             ]:
 
-                f_path = (
-                    f"{clean_name}.{ext}"
-                )
+                f_path = f"{clean_name}.{ext}"
 
                 if (
                     os.path.exists(f_path)
@@ -1245,9 +1337,7 @@ async def process_pwwp(
                             await m.reply_document(
                                 doc,
                                 caption=caption,
-                                file_name=(
-                                    f"{clean_name}.{ext}"
-                                )
+                                file_name=f"{clean_name}.{ext}"
                             )
 
                         uploaded_count += 1
@@ -1263,6 +1353,7 @@ async def process_pwwp(
                     finally:
 
                         if os.path.exists(f_path):
+
                             os.remove(f_path)
 
                 elif os.path.exists(f_path):
@@ -1291,9 +1382,7 @@ async def process_pwwp(
                 "json"
             ]:
 
-                f_path = (
-                    f"{clean_name}.{ext}"
-                )
+                f_path = f"{clean_name}.{ext}"
 
                 if os.path.exists(f_path):
 
@@ -1309,9 +1398,11 @@ async def process_pwwp(
         )
 
         try:
+
             await editable.edit(
                 f"**Error : {e}**"
             )
+
         except Exception:
             pass
 
@@ -1323,9 +1414,7 @@ async def process_pwwp(
                 "json"
             ]:
 
-                f_path = (
-                    f"{clean_name}.{ext}"
-                )
+                f_path = f"{clean_name}.{ext}"
 
                 if os.path.exists(f_path):
 
@@ -1349,13 +1438,13 @@ def register_pwwp_handlers(bot: Client):
 
         await callback_query.answer()
 
-        # Authorization check intentionally left
-        # as it was in your original code.
+        # Authorization check intentionally remains
+        # disabled as in your original code.
         #
         # if not is_authorized(user_id):
         #     await client.send_message(
         #         callback_query.message.chat.id,
-        #         "**You Are Not Subscribed To This Bot.\\n"
+        #         "**You Are Not Subscribed To This Bot.\n"
         #         "Contact Owner.**"
         #     )
         #     return
