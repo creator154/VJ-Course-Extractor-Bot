@@ -73,37 +73,39 @@ bot = Client(
 START_IMAGE = "https://files.catbox.moe/vg3vae.jpg"
 
 START_CAPTION = (
+    "<blockquote>\n"
     "╭━━━ ✦ <b>Zx Extractor</b> ✦ ━━━╮\n\n"
     "⚡ <b>Your Content. One Extractor.</b>\n"
     "🔐 <b>Smart • Reliable • Efficient</b>\n"
     "📚 <b>PW • Classplus • Appx</b>\n\n"
     "<i>Select a platform to begin...</i>\n"
-    "╰━━━━━━━━━━━━━━━━━━━━╯"
+    "╰━━━━━━━━━━━━━━━━━━━━╯\n"
+    "</blockquote>"
 )
 
 
 START_KEYBOARD = InlineKeyboardMarkup([
     [
         InlineKeyboardButton(
-            "👨‍💻 <b>Developer 🇮🇳</b>",
+            "👨‍💻 𝗗𝗲𝘃𝗲𝗹𝗼𝗽𝗲𝗿 🇮🇳",
             url="https://t.me/SumitTripathi"
         )
     ],
     [
         InlineKeyboardButton(
-            "🚀 <b>Physics Wallah 🚀</b>",
+            "🚀 𝗣𝗵𝘆𝘀𝗶𝗰𝘀 𝗪𝗮𝗹𝗹𝗮𝗵 🚀",
             callback_data="pwwp"
         )
     ],
     [
         InlineKeyboardButton(
-            "📘 <b>Classplus 📘</b>",
+            "📘 𝗖𝗹𝗮𝘀𝘀𝗽𝗹𝘂𝘀 📘",
             callback_data="cpwp"
         )
     ],
     [
         InlineKeyboardButton(
-            "📒 <b>Appx 📒</b>",
+            "📒 𝗔𝗽𝗽𝘅 📒",
             callback_data="appxwp"
         )
     ]
@@ -120,7 +122,8 @@ async def start(bot: Client, message: Message):
     await message.reply_photo(
         photo=START_IMAGE,
         caption=START_CAPTION,
-        reply_markup=START_KEYBOARD
+        reply_markup=START_KEYBOARD,
+        parse_mode="html"
     )
 
 
