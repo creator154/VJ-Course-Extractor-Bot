@@ -3,6 +3,7 @@ import os
 import threading
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from pyromod import listen
 
@@ -123,7 +124,7 @@ async def start(bot: Client, message: Message):
         photo=START_IMAGE,
         caption=START_CAPTION,
         reply_markup=START_KEYBOARD,
-        parse_mode="html"
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -137,7 +138,7 @@ async def help(bot: Client, message: Message):
     await message.reply_text(
         "✦ <b>Zx Extractor</b>\n\n"
         "Use /start to open the extractor menu.",
-        parse_mode="html"
+        parse_mode=ParseMode.HTML
     )
 
 
