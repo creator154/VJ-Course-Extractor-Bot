@@ -135,10 +135,6 @@ async def fetch_pwwp_data(
                         url
                     )
 
-                    # ---------------------------------
-                    # AUTHORIZATION ERROR
-                    # ---------------------------------
-
                     if response.status == 401:
 
                         logging.error(
@@ -151,16 +147,11 @@ async def fetch_pwwp_data(
                             response_body[:1000]
                         )
 
-                        # 401 ko retry nahi karna.
                         return {
                             "_auth_error": True,
                             "_status": 401,
                             "_response": response_body
                         }
-
-                    # ---------------------------------
-                    # OTHER HTTP ERRORS
-                    # ---------------------------------
 
                     if response.status >= 400:
 
@@ -180,10 +171,6 @@ async def fetch_pwwp_data(
                             await asyncio.sleep(2 ** attempt)
 
                         continue
-
-                    # ---------------------------------
-                    # SUCCESS JSON
-                    # ---------------------------------
 
                     try:
 
@@ -1030,11 +1017,6 @@ async def process_pwwp(
                 }
             )
 
-            # ---------------------------------
-            # AUTH ERROR — DO NOT CALL IT
-            # "NO BATCHES"
-            # ---------------------------------
-
             if courses_res and courses_res.get("_auth_error"):
 
                 await editable.edit(
@@ -1123,7 +1105,7 @@ async def process_pwwp(
             )
 
             # ---------------------------------
-            # MODE
+            # CONTENT EXTRACTION MODE
             # ---------------------------------
 
             mode = await prompt_user(
@@ -1133,16 +1115,99 @@ async def process_pwwp(
                 (
                     "**Choose Content Extraction Mode:**\n\n"
                     "<blockquote>**1. Full Batch**</blockquote>\n\n"
-                    "<blockquote>**2. Today's Class**</blockquote>"
+                    "<blockquote>**2. Today's Class**</blockquote>\n\n"
+                    "<blockquote>**3. Specific Date Class**</blockquote>"
                 ),
                 user_id
             )
 
-            if mode not in ("1", "2"):
+            if mode not in ("1", "2", "3"):
 
                 await editable.edit(
                     "**Invalid Choice! ❌**"
                 )
+
+                return
+
+            # ---------------------------------
+            # SPECIFIC DATE INPUT
+            # ---------------------------------
+
+            if mode == "3":
+
+                date_input = await prompt_user(
+                    bot,
+                    m,
+                    editable,
+                    (
+                        "📅 **Enter Date in DD/MM/YYYY format**\n\n"
+                        "Example: `25/06/2026`\n\n"
+                        "Or send `today` for today's date\n\n"
+                        "For multiple dates use `&` separator:\n"
+                        "`25/06/2026&26/06/2026&27/06/2026`"
+                    ),
+                    user_id
+                )
+
+                from datetime import datetime
+
+                dates = [
+                    d.strip()
+                    for d in date_input.split("&")
+                    if d.strip()
+                ]
+
+                valid_dates = []
+
+                for date_value in dates:
+
+                    if date_value.lower() == "today":
+
+                        valid_dates.append("today")
+                        continue
+
+                    try:
+
+                        parsed_date = datetime.strptime(
+                            date_value,
+                            "%d/%m/%Y"
+                        )
+
+                        valid_dates.append(
+                            parsed_date.strftime("%d/%m/%Y")
+                        )
+
+                    except ValueError:
+
+                        await editable.edit(
+                            "❌ **Invalid Date Format!**\n\n"
+                            "Please use:\n"
+                            "`DD/MM/YYYY`\n\n"
+                            "Example:\n"
+                            "`25/06/2026`"
+                        )
+
+                        return
+
+                if not valid_dates:
+
+                    await editable.edit(
+                        "❌ **No valid date entered.**"
+                    )
+
+                    return
+
+                await editable.edit(
+                    "📅 **Date Selected Successfully ✅**\n\n"
+                    + "\n".join(
+                        f"• `{date}`"
+                        for date in valid_dates
+                    )
+                )
+
+                # Date selection is complete here.
+                # Continue only with your authorized
+                # date-based API/data handling.
 
                 return
 
