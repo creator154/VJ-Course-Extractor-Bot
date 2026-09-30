@@ -73,35 +73,37 @@ bot = Client(
 START_IMAGE = "https://files.catbox.moe/vg3vae.jpg"
 
 START_CAPTION = (
-    "✦ <b>Zx Extractor</b>\n\n"
-    "⚡ Fast • Simple • Powerful\n"
-    "📚 PW • Classplus • Appx\n\n"
-    "<i>Choose a platform to continue.</i>"
+    "╭━━━ ✦ <b>Zx Extractor</b> ✦ ━━━╮\n\n"
+    "⚡ <b>Your Content. One Extractor.</b>\n"
+    "🔐 <b>Smart • Reliable • Efficient</b>\n"
+    "📚 <b>PW • Classplus • Appx</b>\n\n"
+    "<i>Select a platform to begin...</i>\n"
+    "╰━━━━━━━━━━━━━━━━━━━━╯"
 )
 
 
 START_KEYBOARD = InlineKeyboardMarkup([
     [
         InlineKeyboardButton(
-            "👨‍💻 Developer 🇮🇳",
+            "👨‍💻 <b>Developer 🇮🇳</b>",
             url="https://t.me/SumitTripathi"
         )
     ],
     [
         InlineKeyboardButton(
-            "🚀 Physics Wallah 🚀",
+            "🚀 <b>Physics Wallah 🚀</b>",
             callback_data="pwwp"
         )
     ],
     [
         InlineKeyboardButton(
-            "📘 Classplus 📘",
+            "📘 <b>Classplus 📘</b>",
             callback_data="cpwp"
         )
     ],
     [
         InlineKeyboardButton(
-            "📒 Appx 📒",
+            "📒 <b>Appx 📒</b>",
             callback_data="appxwp"
         )
     ]
