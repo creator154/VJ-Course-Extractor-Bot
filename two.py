@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import time
-import uuid
 from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from pyrogram import Client, filters
@@ -35,7 +34,10 @@ async def prompt_user(bot: Client, message: Message, editable: Message, text: st
     response = await ask_user(bot, message, editable, full_text, user_id)
     
     if response is None or response.strip().lower() == "/cancel":
-        await editable.edit("**Process Cancelled by User ❌**")
+        try:
+            await editable.edit("**Process Cancelled by User ❌**")
+        except Exception:
+            pass
         raise ProcessCancelledException("User requested cancellation.")
     
     return response.strip()
@@ -54,7 +56,6 @@ async def update_status_card(editable: Message, task_name: str, current: int, to
     else:
         eta_str = "Calculating..."
 
-    # Create a 10-block progress bar
     filled_blocks = int(percentage // 10)
     progress_bar = "▓" * filled_blocks + "░" * (10 - filled_blocks)
 
@@ -76,36 +77,80 @@ async def update_status_card(editable: Message, task_name: str, current: int, to
 SEMAPHORE = asyncio.Semaphore(10)
 
 
+def transform_classplus_url(url_val: str) -> Tuple[str, bool]:
+    """Converts Classplus preview image/thumbnail CDN URLs into valid m3u8 stream links."""
+    is_video = False
+
+    if any(ext in url_val.lower() for ext in (".m3u8", ".mpd", "mp4", "video")):
+        return url_val, True
+
+    # 1. Tencent CDN Master M3U8
+    if "media-cdn.classplusapp.com/tencent/" in url_val:
+        url_val = url_val.rsplit('/', 1)[0] + "/master.m3u8"
+        return url_val, True
+
+    # 2. Match CC, LC, UC, DY CDN folder paths with thumbnails
+    if re.search(r'/(cc|lc|uc|dy)/', url_val):
+        url_val = re.sub(r'thumbnail\.(png|jpg|jpeg)$', 'master.m3u8', url_val)
+        return url_val, True
+
+    # 3. Akamai / Azure Classplus Media Thumbnails
+    if ("classplusapp.com" in url_val or "classplus.co" in url_val) and url_val.endswith(('.png', '.jpg', '.jpeg')):
+        if "/media/" in url_val:
+            base_path = url_val.rsplit('/', 1)[0]
+            url_val = f"{base_path}/master.m3u8"
+            return url_val, True
+
+    # 4. Testbook VOD streams
+    if "cpvideocdn.testbook.com" in url_val or "cpvod.testbook.com" in url_val:
+        match = re.search(r'/streams/([a-f0-9]{24})/', url_val)
+        if match:
+            url_val = f'https://cpvod.testbook.com/{match.group(1)}/playlist.m3u8'
+            return url_val, True
+
+    # 5. Classplus DRM streams
+    if "media-cdn.classplusapp.com/drm/" in url_val:
+        parts = url_val.split('/')
+        if len(parts) >= 5:
+            video_id = parts[-3] if url_val.endswith(('.png', '.jpg', '.jpeg')) else parts[-2]
+            url_val = f'https://media-cdn.classplusapp.com/drm/{video_id}/playlist.m3u8'
+            return url_val, True
+
+    return url_val, is_video
+
+
 async def fetch_cpwp_signed_url(url_val: str, name: str, session: aiohttp.ClientSession, headers: Dict[str, str]) -> Optional[str]:
     async with SEMAPHORE:
         try:
             async with session.get("https://api.classplusapp.com/cams/uploader/video/jw-signed-url", params={"url": url_val}, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("url") or data.get("drmUrls", {}).get("manifestUrl")
+                    return data.get("url") or data.get("drmUrls", {}).get("manifestUrl") or data.get("signedUrl")
         except Exception as e:
             logging.error(f"Error fetching signed URL for {name}: {e}")
         return None
 
 
-async def process_cpwp_url(url_val: str, name: str, session: aiohttp.ClientSession, headers: Dict[str, str]) -> Optional[str]:
-    try:
-        signed_url = await fetch_cpwp_signed_url(url_val, name, session, headers)
-        if not signed_url:
-            logging.warning(f"Failed to obtain signed URL for {name}: {url_val}")
-            return None
+async def process_cpwp_url(url_val: str, name: str, session: aiohttp.ClientSession, headers: Dict[str, str]) -> Tuple[str, str]:
+    """Returns a tuple of (formatted_string, content_type_category)."""
+    transformed_url, is_video = transform_classplus_url(url_val)
 
-        if "testbook.com" in url_val or "classplusapp.com/drm" in url_val or "media-cdn.classplusapp.com/drm" in url_val:
-            return f"{name}:{url_val}\n"
+    lower_url = transformed_url.lower()
+    if ".pdf" in lower_url:
+        return f"{name}:{transformed_url}\n", "pdf"
+    if any(ext in lower_url for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return f"{name}:{transformed_url}\n", "image"
 
-        async with SEMAPHORE:
-            async with session.get(signed_url) as response:
-                response.raise_for_status()
-                return f"{name}:{signed_url}\n"
+    if not is_video:
+        return f"{name}:{transformed_url}\n", "other"
 
-    except Exception:
-        pass
-    return None
+    if "testbook.com" in transformed_url or "drm" in transformed_url:
+        return f"{name}:{transformed_url}\n", "video"
+
+    signed_url = await fetch_cpwp_signed_url(transformed_url, name, session, headers)
+    final_url = signed_url if signed_url else transformed_url
+
+    return f"{name}:{final_url}\n", "video"
 
 
 async def get_cpwp_course_content(
@@ -116,138 +161,165 @@ async def get_cpwp_course_content(
     start_time: float,
     folder_id: int = 0,
     limit: int = 9999999999,
-    retry_count: int = 0,
     progress_stats: Optional[Dict[str, int]] = None
 ) -> Tuple[List[str], int, int, int]:
     if progress_stats is None:
         progress_stats = {"processed": 0, "total": 1}
 
     MAX_RETRIES = 3
-    fetched_urls: set[str] = set()
+    fetched_urls: set = set()
     results: List[str] = []
     video_count = 0
     pdf_count = 0
     image_count = 0
-    content_tasks: List[Tuple[int, asyncio.Task[Optional[str]]]] = []
-    folder_tasks: List[Tuple[int, asyncio.Task[Tuple[List[str], int, int, int]]]] = []
+    content_tasks: List[asyncio.Task] = []
+    folder_tasks: List[asyncio.Task] = []
 
-    try:
-        content_api = f'https://api.classplusapp.com/v2/course/preview/content/list/{Batch_Token}'
-        params = {'folderId': folder_id, 'limit': limit}
+    contents: List[Dict[str, Any]] = []
 
-        async with SEMAPHORE:
-            async with session.get(content_api, params=params, headers=headers) as res:
-                res.raise_for_status()
-                res_json = await res.json()
-                contents: List[Dict[str, Any]] = res_json.get('data', [])
-
-            progress_stats["total"] += len(contents)
-
-            for content in contents:
-                progress_stats["processed"] += 1
-                current_item = content.get('name', 'Item')
-                
-                if progress_stats["processed"] % 5 == 0 or progress_stats["processed"] == progress_stats["total"]:
-                    await update_status_card(
-                        editable=editable,
-                        task_name="Scanning Course Contents",
-                        current=progress_stats["processed"],
-                        total=progress_stats["total"],
-                        start_time=start_time,
-                        activity=f"Scanning: `{current_item[:30]}`"
-                    )
-
-                if content.get('contentType') == 1:
-                    folder_task = asyncio.create_task(
-                        get_cpwp_course_content(
-                            session, headers, Batch_Token, editable, start_time,
-                            folder_id=content['id'], retry_count=0, progress_stats=progress_stats
-                        )
-                    )
-                    folder_tasks.append((content['id'], folder_task))
-
-                else:
-                    name: str = content.get('name', '')
-                    url_val: Optional[str] = content.get('url') or content.get('thumbnailUrl')
-
-                    if not url_val:
-                        logging.warning(f"No URL found for content: {name}")
-                        continue
-
-                    if "media-cdn.classplusapp.com/tencent/" in url_val:
-                        url_val = url_val.rsplit('/', 1)[0] + "/master.m3u8"
-                    elif "media-cdn.classplusapp.com" in url_val and url_val.endswith('.jpg'):
-                        identifier = url_val.split('/')[-3]
-                        url_val = f'https://media-cdn.classplusapp.com/alisg-cdn-a.classplusapp.com/{identifier}/master.m3u8'
-                    elif "tencdn.classplusapp.com" in url_val and url_val.endswith('.jpg'):
-                        identifier = url_val.split('/')[-2]
-                        url_val = f'https://media-cdn.classplusapp.com/tencent/{identifier}/master.m3u8'
-                    elif "4b06bf8d61c41f8310af9b2624459378203740932b456b07fcf817b737fbae27" in url_val and url_val.endswith('.jpeg'):
-                        url_val = f'https://media-cdn.classplusapp.com/alisg-cdn-a.classplusapp.com/b08bad9ff8d969639b2e43d5769342cc62b510c4345d2f7f153bec53be84fe35/{url_val.split("/")[-1].split(".")[0]}/master.m3u8'
-                    elif "cpvideocdn.testbook.com" in url_val and url_val.endswith('.png'):
-                        match = re.search(r'/streams/([a-f0-9]{24})/', url_val)
-                        video_id = match.group(1) if match else url_val.split('/')[-2]
-                        url_val = f'https://cpvod.testbook.com/{video_id}/playlist.m3u8'
-                    elif "media-cdn.classplusapp.com/drm/" in url_val and url_val.endswith('.png'):
-                        video_id = url_val.split('/')[-3]
-                        url_val = f'https://media-cdn.classplusapp.com/drm/{video_id}/playlist.m3u8'
-                    elif "https://media-cdn.classplusapp.com" in url_val and ("cc/" in url_val or "lc/" in url_val or "uc/" in url_val or "dy/" in url_val) and url_val.endswith('.png'):
-                        url_val = url_val.replace('thumbnail.png', 'master.m3u8')
-                    elif "https://tb-video.classplusapp.com" in url_val and url_val.endswith('.jpg'):
-                        video_id = url_val.split('/')[-1].split('.')[0]
-                        url_val = f'https://tb-video.classplusapp.com/{video_id}/master.m3u8'
-
-                    if url_val.endswith(("master.m3u8", "playlist.m3u8")) and url_val not in fetched_urls:
-                        fetched_urls.add(url_val)
-                        task = asyncio.create_task(process_cpwp_url(url_val, name, session, headers))
-                        content_tasks.append((content['id'], task))
-
-                    else:
-                        url_val = content.get('url')
-                        if url_val:
-                            fetched_urls.add(url_val)
-                            results.append(f"{name}:{url_val}\n")
-                            if url_val.endswith('.pdf'):
-                                pdf_count += 1
-                            else:
-                                image_count += 1
-
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred: {e}")
-        if retry_count < MAX_RETRIES:
-            logging.info(f"Retrying folder {folder_id} (Attempt {retry_count + 1}/{MAX_RETRIES})")
-            await asyncio.sleep(2 ** retry_count)
-            return await get_cpwp_course_content(
-                session, headers, Batch_Token, editable, start_time,
-                folder_id, limit, retry_count + 1, progress_stats
-            )
-        else:
-            logging.error(f"Failed to retrieve folder {folder_id} after {MAX_RETRIES} retries.")
-            return [], 0, 0, 0
-
-    content_results = await asyncio.gather(*(task for _, task in content_tasks), return_exceptions=True)
-
-    for (f_id, _), result in zip(content_tasks, content_results):
-        if isinstance(result, Exception):
-            logging.error(f"Task failed with exception: {result}")
-        elif result:
-            results.append(result)
-            video_count += 1
-
-    for f_id, folder_task in folder_tasks:
+    for retry in range(MAX_RETRIES):
         try:
-            res = await folder_task
-            if res and isinstance(res, tuple) and len(res) == 4:
+            content_api = f'https://api.classplusapp.com/v2/course/preview/content/list/{Batch_Token}'
+            params = {'folderId': folder_id, 'limit': limit}
+
+            async with SEMAPHORE:
+                async with session.get(content_api, params=params, headers=headers) as res:
+                    res.raise_for_status()
+                    res_json = await res.json()
+                    contents = res_json.get('data', [])
+                    break
+        except Exception as e:
+            logging.warning(f"Attempt {retry + 1} failed for folder {folder_id}: {e}")
+            if retry == MAX_RETRIES - 1:
+                return [], 0, 0, 0
+            await asyncio.sleep(2 ** retry)
+
+    progress_stats["total"] += len(contents)
+
+    for content in contents:
+        progress_stats["processed"] += 1
+        current_item = content.get('name', 'Item')
+        
+        if progress_stats["processed"] % 5 == 0 or progress_stats["processed"] == progress_stats["total"]:
+            await update_status_card(
+                editable=editable,
+                task_name="Scanning Course Contents",
+                current=progress_stats["processed"],
+                total=progress_stats["total"],
+                start_time=start_time,
+                activity=f"Scanning: `{current_item[:30]}`"
+            )
+
+        content_type = content.get('contentType')
+
+        # Folder processing
+        if content_type == 1:
+            folder_task = asyncio.create_task(
+                get_cpwp_course_content(
+                    session, headers, Batch_Token, editable, start_time,
+                    folder_id=content['id'], progress_stats=progress_stats
+                )
+            )
+            folder_tasks.append(folder_task)
+        else:
+            name: str = content.get('name', '').strip()
+            raw_url: Optional[str] = (
+                content.get('url') 
+                or content.get('videoUrl') 
+                or content.get('streamUrl') 
+                or content.get('thumbnailUrl')
+            )
+
+            if not raw_url:
+                continue
+
+            transformed_url, is_video = transform_classplus_url(raw_url)
+
+            if transformed_url in fetched_urls:
+                continue
+            fetched_urls.add(transformed_url)
+
+            lower_url = transformed_url.lower()
+
+            # Categorize PDFs first
+            if ".pdf" in lower_url or content_type == 4:
+                pdf_count += 1
+                results.append(f"{name}:{transformed_url}\n")
+            # Categorize Images next
+            elif any(ext in lower_url for ext in (".jpg", ".jpeg", ".png", ".webp")) or content_type == 5:
+                image_count += 1
+                results.append(f"{name}:{transformed_url}\n")
+            # Categorize Videos
+            elif is_video or content_type in (2, 3):
+                task = asyncio.create_task(process_cpwp_url(raw_url, name, session, headers))
+                content_tasks.append(task)
+            # General fallback
+            else:
+                if ".pdf" in raw_url.lower():
+                    pdf_count += 1
+                elif any(ext in raw_url.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    image_count += 1
+                results.append(f"{name}:{transformed_url}\n")
+
+    # Resolve async tasks and collect true counts
+    if content_tasks:
+        resolved_items = await asyncio.gather(*content_tasks, return_exceptions=True)
+        for item in resolved_items:
+            if isinstance(item, tuple) and len(item) == 2:
+                line_str, category = item
+                results.append(line_str)
+                if category == "video":
+                    video_count += 1
+                elif category == "pdf":
+                    pdf_count += 1
+                elif category == "image":
+                    image_count += 1
+
+    # Resolve sub-folder async tasks
+    if folder_tasks:
+        resolved_folder_items = await asyncio.gather(*folder_tasks, return_exceptions=True)
+        for res in resolved_folder_items:
+            if isinstance(res, tuple) and len(res) == 4:
                 nested_results, nested_video_count, nested_pdf_count, nested_image_count = res
-                if nested_results:
-                    results.extend(nested_results)
+                results.extend(nested_results)
                 video_count += nested_video_count
                 pdf_count += nested_pdf_count
                 image_count += nested_image_count
-        except Exception as e:
-            logging.error(f"Error processing folder {f_id}: {e}")
 
     return results, video_count, pdf_count, image_count
+
+
+async def search_courses_api(session: aiohttp.ClientSession, headers: dict, org_code: str, query: str) -> List[dict]:
+    search_url = f"https://api.classplusapp.com/v2/course/preview/search?searchQuery={query}&limit=30"
+    search_headers = {
+        **headers,
+        'tutorWebsiteDomain': f'https://{org_code}.courses.store'
+    }
+    async with session.get(search_url, headers=search_headers) as resp:
+        if resp.status == 200:
+            res_json = await resp.json()
+            return res_json.get('data', {}).get('coursesData', []) or res_json.get('data', [])
+    return []
+
+
+async def get_enrolled_courses(session: aiohttp.ClientSession, headers: dict):
+    purchased_url = "https://api.classplusapp.com/v2/course/purchased"
+    async with session.get(purchased_url, headers=headers) as resp:
+        if resp.status == 200:
+            res_json = await resp.json()
+            courses = res_json.get('data', {}).get('courses', []) or res_json.get('data', [])
+            if isinstance(courses, list) and courses:
+                return courses
+
+    my_courses_url = "https://api.classplusapp.com/v2/course/list"
+    async with session.get(my_courses_url, headers=headers) as resp:
+        if resp.status == 200:
+            res_json = await resp.json()
+            courses = res_json.get('data', {}).get('courses', [])
+            if isinstance(courses, list) and courses:
+                return courses
+
+    return []
 
 
 async def process_cpwp(bot: Client, m: Message, user_id: int):
@@ -346,146 +418,151 @@ async def process_cpwp(bot: Client, m: Message, user_id: int):
                     await editable.edit("**Failed to retrieve Access Token from Classplus ❌**")
                     return
 
-                await editable.edit(f"**Classplus Login Successful ✅**\n\n**Token:** `{access_token}`\n\n**Do not share this token with anyone save it anywhere in private.**")
+                await editable.edit(f"**Classplus Login Successful ✅**\n\n**Token:** `{access_token}`")
                 editable = await m.reply_text("**Wait Processing Your Request....**")
             else:
                 access_token = raw_input
 
             headers['x-access-token'] = access_token
 
-            hash_headers = {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br, zstd',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': f'https://{org_code}.courses.store/?mainCategory=0',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-            }
+            await editable.edit("**Fetching Enrolled Courses... ⏳**")
+            courses = await get_enrolled_courses(session, headers)
 
-            async with session.get(f"https://{org_code}.courses.store", headers=hash_headers) as response:
-                html_text = await response.text()
-                hash_match = re.search(r'["\']hash["\']\s*:\s*["\']([^"\']+)["\']', html_text)
+            if not courses:
+                hash_headers = {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br, zstd',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': f'https://{org_code}.courses.store/?mainCategory=0',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+                }
 
-                if not hash_match:
-                    await editable.edit("**No App Found In Org Code ❌**")
+                async with session.get(f"https://{org_code}.courses.store", headers=hash_headers) as response:
+                    html_text = await response.text()
+                    hash_match = re.search(r'["\']hash["\']\s*:\s*["\']([^"\']+)["\']', html_text)
+
+                    if hash_match:
+                        token = hash_match.group(1)
+                        async with session.get(f"https://api.classplusapp.com/v2/course/preview/similar/{token}?limit=30", headers=headers) as resp:
+                            if resp.status == 200:
+                                res_json = await resp.json()
+                                courses = res_json.get('data', {}).get('coursesData', [])
+
+            if not courses:
+                await editable.edit("**Didn't Find Any Course ❌**")
+                return
+
+            text = ''.join([
+                f"<blockquote>**{cnt + 1}.** `\n{c.get('name')} 💵₹{c.get('finalPrice', c.get('price', 'N/A'))}`</blockquote>\n"
+                for cnt, c in enumerate(courses)
+            ])
+            raw_text2 = await prompt_user(bot, m, editable, f"**Send index number of the Course**\n\n{text}\n**If Your Batch Not Listed Then Enter Your Batch Name**", user_id)
+
+            course = None
+            raw_text2 = raw_text2.strip()
+            if raw_text2.isdigit() and 1 <= int(raw_text2) <= len(courses):
+                course = courses[int(raw_text2) - 1]
+            else:
+                search_term = raw_text2.lower()
+                matched_courses = [c for c in courses if search_term in c.get('name', '').lower()]
+
+                if not matched_courses:
+                    await editable.edit(f"**Searching for `{raw_text2}` across all app batches... ⏳**")
+                    matched_courses = await search_courses_api(session, headers, org_code, raw_text2)
+
+                if matched_courses:
+                    text_search = ''.join([
+                        f"<blockquote>**{cnt + 1}.** `\n{c.get('name')} 💵₹{c.get('finalPrice', c.get('price', 'N/A'))}`</blockquote>\n"
+                        for cnt, c in enumerate(matched_courses)
+                    ])
+                    raw_text3 = await prompt_user(bot, m, editable, f"**Send index number of the Batch to download.**\n\n{text_search}", user_id)
+
+                    raw_text3 = raw_text3.strip()
+                    if raw_text3.isdigit() and 1 <= int(raw_text3) <= len(matched_courses):
+                        course = matched_courses[int(raw_text3) - 1]
+                    else:
+                        await editable.edit("**Wrong Index Number ❌**")
+                        return
+                else:
+                    await editable.edit("**Didn't Find Any Course Matching The Search Term ❌**")
                     return
 
-                token = hash_match.group(1)
+            if not course:
+                await editable.edit("**Invalid course selection ❌**")
+                return
 
-                async with session.get(f"https://api.classplusapp.com/v2/course/preview/similar/{token}?limit=20", headers=headers) as resp:
-                    if resp.status != 200:
-                        await editable.edit(f"**Error Fetching Courses:** `{await resp.text()}`")
-                        return
+            selected_batch_id = course.get('id') or course.get('courseId')
+            selected_batch_name = course.get('name', 'Course')
+            clean_batch_name = re.sub(r'[\\/*?:"<>|]', "-", selected_batch_name)
+            file_path = f"{clean_batch_name}.txt"
 
-                    res_json = await resp.json()
-                    courses = res_json.get('data', {}).get('coursesData', [])
+            batch_headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'region': 'IN',
+                'accept-language': 'EN',
+                'Api-Version': '22',
+                'x-access-token': access_token,
+                'tutorWebsiteDomain': f'https://{org_code}.courses.store'
+            }
 
-                    if not courses:
-                        await editable.edit("**Didn't Find Any Course ❌**")
-                        return
+            params = {'courseId': f'{selected_batch_id}'}
 
-                    text = ''.join([f"<blockquote>**{cnt + 1}.** `\n{c['name']} 💵₹{c['finalPrice']}`</blockquote>\n" for cnt, c in enumerate(courses)])
-                    raw_text2 = await prompt_user(bot, m, editable, f"**Send index number of the Category Name**\n\n{text}\n**If Your Batch Not Listed Then Enter Your Batch Name**", user_id)
+            async with session.get("https://api.classplusapp.com/v2/course/preview/org/info", params=params, headers=batch_headers) as info_resp:
+                if info_resp.status == 200:
+                    res_info = await info_resp.json()
+                    Batch_Token = res_info['data']['hash']
+                    App_Name = res_info['data']['name']
 
-                    raw_text2 = raw_text2.strip()
-                    if raw_text2.isdigit() and 1 <= int(raw_text2) <= len(courses):
-                        selected_course_index = int(raw_text2)
-                        course = courses[selected_course_index - 1]
+                    start_time = time.time()
+                    await update_status_card(
+                        editable=editable,
+                        task_name=f"Extracting: {selected_batch_name}",
+                        current=0,
+                        total=100,
+                        start_time=start_time,
+                        activity="Initializing content crawler..."
+                    )
+
+                    course_content, video_count, pdf_count, image_count = await get_cpwp_course_content(
+                        session, headers, Batch_Token, editable, start_time
+                    )
+
+                    if course_content:
+                        await update_status_card(
+                            editable=editable,
+                            task_name=f"Extracting: {selected_batch_name}",
+                            current=100,
+                            total=100,
+                            start_time=start_time,
+                            activity="Saving content links to file..."
+                        )
+
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(''.join(course_content))
+
+                        formatted_time = format_time(time.time() - start_time)
+
+                        await editable.delete()
+
+                        caption = f"**App Name : ```\n{App_Name}({org_code})```\nBatch Name : ```\n{selected_batch_name}``````\n🎬 : {video_count} | 📁 : {pdf_count} | 🖼  : {image_count}``````\nTime Taken : {formatted_time}```**"
+
+                        with open(file_path, 'rb') as f:
+                            await m.reply_document(document=f, caption=caption, file_name=f"{clean_batch_name}.txt")
+
                     else:
-                        search_url = f"https://api.classplusapp.com/v2/course/preview/similar/{token}?search={raw_text2}"
-                        async with session.get(search_url, headers=headers) as search_resp:
-                            if search_resp.status == 200:
-                                search_json = await search_resp.json()
-                                search_courses = search_json.get("data", {}).get("coursesData", [])
-
-                                if not search_courses:
-                                    await editable.edit("**Didn't Find Any Course Matching The Search Term ❌**")
-                                    return
-
-                                text_search = ''.join([f"<blockquote>**{cnt + 1}.** `\n{c['name']} 💵₹{c['finalPrice']}`</blockquote>\n" for cnt, c in enumerate(search_courses)])
-                                raw_text3 = await prompt_user(bot, m, editable, f"**Send index number of the Batch to download.**\n\n{text_search}", user_id)
-
-                                raw_text3 = raw_text3.strip()
-                                if raw_text3.isdigit() and 1 <= int(raw_text3) <= len(search_courses):
-                                    selected_course_index = int(raw_text3)
-                                    course = search_courses[selected_course_index - 1]
-                                else:
-                                    await editable.edit("**Wrong Index Number ❌**")
-                                    return
-                            else:
-                                await editable.edit(f"**Error:** `{await search_resp.text()}`")
-                                return
-
-                    selected_batch_id = course['id']
-                    selected_batch_name = course['name']
-                    clean_batch_name = re.sub(r'[\\/*?:"<>|]', "-", selected_batch_name)
-                    file_path = f"{clean_batch_name}.txt"
-
-                    batch_headers = {
-                        'Accept': 'application/json, text/plain, */*',
-                        'region': 'IN',
-                        'accept-language': 'EN',
-                        'Api-Version': '22',
-                        'x-access-token': access_token,
-                        'tutorWebsiteDomain': f'https://{org_code}.courses.store'
-                    }
-
-                    params = {'courseId': f'{selected_batch_id}'}
-
-                    async with session.get("https://api.classplusapp.com/v2/course/preview/org/info", params=params, headers=batch_headers) as info_resp:
-                        if info_resp.status == 200:
-                            res_info = await info_resp.json()
-                            Batch_Token = res_info['data']['hash']
-                            App_Name = res_info['data']['name']
-
-                            start_time = time.time()
-                            await update_status_card(
-                                editable=editable,
-                                task_name=f"Extracting: {selected_batch_name}",
-                                current=0,
-                                total=100,
-                                start_time=start_time,
-                                activity="Initializing content crawler..."
-                            )
-
-                            course_content, video_count, pdf_count, image_count = await get_cpwp_course_content(
-                                session, headers, Batch_Token, editable, start_time
-                            )
-
-                            if course_content:
-                                await update_status_card(
-                                    editable=editable,
-                                    task_name=f"Extracting: {selected_batch_name}",
-                                    current=100,
-                                    total=100,
-                                    start_time=start_time,
-                                    activity="Saving content links to file..."
-                                )
-
-                                with open(file_path, 'w', encoding='utf-8') as f:
-                                    f.write(''.join(course_content))
-
-                                formatted_time = format_time(time.time() - start_time)
-
-                                await editable.delete()
-
-                                caption = f"**App Name : ```\n{App_Name}({org_code})```\nBatch Name : ```\n{selected_batch_name}``````\n🎬 : {video_count} | 📁 : {pdf_count} | 🖼  : {image_count}``````\nTime Taken : {formatted_time}```**"
-
-                                with open(file_path, 'rb') as f:
-                                    await m.reply_document(document=f, caption=caption, file_name=f"{clean_batch_name}.txt")
-
-                                if os.path.exists(file_path):
-                                    os.remove(file_path)
-                            else:
-                                await editable.edit("**Didn't Find Any Content In The Course ❌**")
-                        else:
-                            await editable.edit(f"**Error:** `{await info_resp.text()}`")
+                        await editable.edit("**Didn't Find Any Content In The Course ❌**")
+                else:
+                    await editable.edit(f"**Error:** `{await info_resp.text()}`")
 
         except ProcessCancelledException:
             pass
         except Exception as e:
             logging.exception("Error in process_cpwp:")
             if editable:
-                await editable.edit(f"**Error : {e}**")
+                try:
+                    await editable.edit(f"**Error : {e}**")
+                except Exception:
+                    pass
         finally:
             if file_path and os.path.exists(file_path):
                 try:
@@ -499,7 +576,4 @@ def register_cpwp_handlers(bot: Client):
     async def cpwp_callback(client: Client, callback_query):
         user_id = callback_query.from_user.id
         await callback_query.answer()
-      #  if not is_authorized(user_id):
-      #      await client.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot.\nContact Owner.**")
-      #      return
         asyncio.create_task(process_cpwp(client, callback_query.message, user_id))
