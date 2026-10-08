@@ -29,12 +29,19 @@ PW_TOKENS = [
 
 
 def get_random_pw_token() -> str:
-    """Returns a random access token from the pool."""
-    valid_tokens = [t for t in PW_TOKENS if not t.startswith("YOUR_PW")]
+    """Returns a cleaned random access token from the pool."""
+    valid_tokens = [t.strip() for t in PW_TOKENS if t and not t.startswith("YOUR_PW")]
     if not valid_tokens:
         logging.warning("No valid tokens found in PW_TOKENS pool!")
-        return PW_TOKENS[0] if PW_TOKENS else ""
-    return random.choice(valid_tokens)
+        token = PW_TOKENS[0] if PW_TOKENS else ""
+    else:
+        token = random.choice(valid_tokens)
+
+    # Automatically clean duplicate 'Bearer ' prefix if present
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    return token
 
 
 class ProcessCancelledException(Exception):
@@ -640,6 +647,7 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
         "referer": "https://www.pw.live/",
         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/148.0.0.0 Safari/537.36",
         "client-id": "5eb393ee95fab7468a79d189",
+        "organizationid": "5eb393ee95fab7468a79d189",
         "client-type": "WEB",
         "content-type": "application/json",
         "randomid": str(uuid.uuid4()),
@@ -829,6 +837,7 @@ async def process_pwwp_today_pdfs(bot: Client, m: Message, user_id: int):
         "referer": "https://www.pw.live/",
         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/148.0.0.0 Safari/537.36",
         "client-id": "5eb393ee95fab7468a79d189",
+        "organizationid": "5eb393ee95fab7468a79d189",
         "client-type": "WEB",
         "content-type": "application/json",
         "randomid": str(uuid.uuid4()),
