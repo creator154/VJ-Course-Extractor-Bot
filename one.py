@@ -6,11 +6,12 @@ import random
 import time
 import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -275,6 +276,19 @@ async def fetch_pwwp_data(
     return None
 
 
+# Cache so the same schedule-details is never fetched twice
+# (same item can show up in several chapters / content types).
+_DETAILS_CACHE: Dict[str, "asyncio.Future"] = {}
+
+
+async def get_schedule_details(session, url: str, headers: Dict):
+    fut = _DETAILS_CACHE.get(url)
+    if fut is None:
+        fut = asyncio.ensure_future(fetch_pwwp_data(session, url, headers=headers))
+        _DETAILS_CACHE[url] = fut
+    return await asyncio.shield(fut)
+
+
 async def process_pwwp_chapter_content(
     session: aiohttp.ClientSession,
     selected_batch_id: str,
@@ -290,7 +304,7 @@ async def process_pwwp_chapter_content(
         f"{schedule_id}/schedule-details"
     )
 
-    data = await fetch_pwwp_data(session, url, headers=headers)
+    data = await get_schedule_details(session, url, headers)
     content = []
 
     if data and not data.get("_auth_error") and data.get("success") and data.get("data"):
@@ -390,7 +404,15 @@ async def process_pwwp_chapters(
         ]
     )
 
-    flat_schedule = [s for sublist in all_schedules for s in sublist]
+    flat_schedule = []
+    seen = set()
+    for sublist in all_schedules:
+        for s in sublist:
+            key = (s.get("_id"), s.get("content_type"))
+            if key in seen:
+                continue
+            seen.add(key)
+            flat_schedule.append(s)
     tasks = []
 
     for item in flat_schedule:
@@ -536,6 +558,7 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
         "x-sdk-version": "0.0.25",
     }
 
+    _DETAILS_CACHE.clear()
     base_payload = {"organizationId": "5eb393ee95fab7468a79d189"}
     editable = await m.reply_text("**Wait initializing process... ⏳**")
     clean_name = None
@@ -774,6 +797,263 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
             pass
 
 
+# ======================= TODAY'S CLASS FEATURE =======================
+
+PW_ORG_ID = "5eb393ee95fab7468a79d189"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _base_api_headers() -> Dict:
+    return {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "https://www.pw.live",
+        "referer": "https://www.pw.live/",
+        "user-agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "Chrome/148.0.0.0 Safari/537.36"
+        ),
+        "client-id": PW_ORG_ID,
+        "client-type": "WEB",
+        "content-type": "application/json",
+        "randomid": str(uuid.uuid4()),
+        "x-sdk-version": "0.0.25",
+    }
+
+
+async def pw_login_flow(bot, m, editable, session, user_id, api_headers) -> Optional[Dict]:
+    """Token or phone+OTP login. Returns auth headers or None."""
+    base_payload = {"organizationId": PW_ORG_ID}
+
+    raw_input = await prompt_user(
+        bot, m, editable,
+        "**Enter Your Account Access Token or Phone Number:**",
+        user_id
+    )
+
+    if raw_input.isdigit() and len(raw_input) == 10:
+        await editable.edit("**Sending OTP to registered phone... ⏳**")
+        async with session.post(
+            "https://api.penpencil.co/v1/users/get-otp-secure?smsType=0",
+            headers={**api_headers, "randomid": str(uuid.uuid4())},
+            json={**base_payload, "username": raw_input, "countryCode": "+91"}
+        ) as resp:
+            if resp.status == 429:
+                await editable.edit("**Too many OTP requests ⏳ Wait a few minutes and try again.**")
+                return None
+            if resp.status >= 400:
+                await editable.edit("**OTP Request Failed ❌**")
+                return None
+
+        otp = await prompt_user(bot, m, editable, "**Enter OTP received on phone:**", user_id)
+        if not otp.isdigit():
+            await editable.edit("**Invalid OTP format! ❌**")
+            return None
+
+        await editable.edit("**Verifying OTP... ⏳**")
+        async with session.post(
+            "https://api.penpencil.co/v3/oauth/token",
+            headers={**api_headers, "randomid": str(uuid.uuid4())},
+            json={
+                **base_payload,
+                "client_id": "system-admin",
+                "grant_type": "password",
+                "latitude": 0,
+                "longitude": 0,
+                "username": raw_input,
+                "otp": str(otp)
+            }
+        ) as resp:
+            if resp.status >= 400:
+                await editable.edit("**Login Failed ❌**")
+                return None
+            res_data = await resp.json()
+            access_token = (res_data.get("data") or {}).get("access_token")
+
+        if not access_token:
+            await editable.edit("**Login Failed ❌ Invalid response.**")
+            return None
+    else:
+        access_token = raw_input.strip()
+        if access_token.lower().startswith("bearer "):
+            access_token = access_token[7:].strip()
+
+    if not access_token:
+        await editable.edit("**Invalid Access Token ❌**")
+        return None
+
+    return {**api_headers, "authorization": f"Bearer {access_token}"}
+
+
+async def pw_select_batch_flow(bot, m, editable, session, user_id, auth_headers) -> Optional[Dict]:
+    """Search batch by name and let user pick. Returns the selected course dict."""
+    batch_search = await prompt_user(bot, m, editable, "**Enter Batch Name to Search:**", user_id)
+    await editable.edit("**Searching courses online... 🔍**")
+
+    courses_res = await fetch_pwwp_data(
+        session,
+        "https://api.penpencil.co/v3/batches/search",
+        headers=auth_headers,
+        params={"name": batch_search}
+    )
+
+    if courses_res and courses_res.get("_auth_error"):
+        await editable.edit("🔐 **Authorization Failed ❌ HTTP 401**")
+        return None
+
+    courses = courses_res.get("data", []) if courses_res else []
+    if not courses:
+        await editable.edit("❌ **No Batches Found!**")
+        return None
+
+    text_list = "\n".join(
+        [f"<blockquote>**{i + 1}.** `{c.get('name', 'Batch')}`</blockquote>" for i, c in enumerate(courses)]
+    )
+    idx_str = await prompt_user(
+        bot, m, editable,
+        f"**Select Course Index:**\n\n{text_list}",
+        user_id
+    )
+
+    if not idx_str.isdigit() or not (1 <= int(idx_str) <= len(courses)):
+        await editable.edit("**Invalid Selection ❌**")
+        return None
+
+    return courses[int(idx_str) - 1]
+
+
+def _fmt_ist(iso_str: Optional[str]) -> str:
+    if not iso_str:
+        return "--:--"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%I:%M %p")
+    except Exception:
+        return "--:--"
+
+
+def _name_of(x: Any) -> str:
+    if isinstance(x, dict):
+        return x.get("name") or x.get("subject") or ""
+    return str(x) if x else ""
+
+
+def format_today_classes(items: List[Dict], batch_name: str) -> List[str]:
+    """Returns message chunks (<4000 chars each) for Telegram."""
+    today = datetime.now(IST).strftime("%d %b %Y")
+    header = f"📅 **Today's Classes — {today}**\n📚 `{batch_name}`\n\n"
+
+    def sort_key(it):
+        return (it.get("startTime") or "")
+
+    blocks = []
+    for n, it in enumerate(sorted(items, key=sort_key), 1):
+        topic = it.get("topic") or "Untitled"
+        subject = _name_of(it.get("subjectId")) or _name_of(it.get("subject"))
+        teachers = it.get("teacherIds") or []
+        teacher = ", ".join(filter(None, (_name_of(t) if isinstance(t, dict) else "" for t in teachers)))
+        if not teacher:
+            teacher = ""
+        if not teacher and teachers and isinstance(teachers[0], dict):
+            t0 = teachers[0]
+            teacher = ((t0.get("firstName") or "") + " " + (t0.get("lastName") or "")).strip()
+
+        status = "🔴 LIVE" if it.get("isLive") else ""
+        url = extract_url_from_video_details(it)
+
+        lines = [
+            f"**{n}. {topic}** {status}".strip(),
+            f"⏰ {_fmt_ist(it.get('startTime'))} - {_fmt_ist(it.get('endTime'))}",
+        ]
+        if subject:
+            lines.append(f"📖 {subject}")
+        if teacher:
+            lines.append(f"👨‍🏫 {teacher}")
+        if url:
+            lines.append(f"🔗 `{url}`")
+        blocks.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
+
+    chunks, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += b + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
+async def process_pwwp_today(bot: Client, m: Message, user_id: int):
+    api_headers = _base_api_headers()
+    editable = await m.reply_text("**Wait initializing process... ⏳**")
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+
+            auth_headers = await pw_login_flow(bot, m, editable, session, user_id, api_headers)
+            if not auth_headers:
+                return
+
+            course = await pw_select_batch_flow(bot, m, editable, session, user_id, auth_headers)
+            if not course:
+                return
+
+            batch_id = course["_id"]
+            batch_name = course.get("name", "Batch")
+
+            await editable.edit(f"📅 **Fetching today's classes for** `{batch_name}` ... ⏳")
+
+            res = await fetch_pwwp_data(
+                session,
+                f"https://api.penpencil.co/v1/batches/{batch_id}/todays-schedule",
+                headers=auth_headers
+            )
+
+            if res and res.get("_auth_error"):
+                await editable.edit("🔐 **Authorization Failed ❌ HTTP 401**")
+                return
+
+            if not res:
+                await editable.edit("**Could not fetch today's schedule ❌ (API error, check logs).**")
+                return
+
+            data = res.get("data")
+            if isinstance(data, dict):  # some responses wrap the list
+                data = data.get("schedules") or data.get("data") or []
+            items = data or []
+
+            if not items:
+                await editable.edit(f"📭 **No classes scheduled today for** `{batch_name}`")
+                return
+
+            chunks = format_today_classes(items, batch_name)
+            await editable.edit(chunks[0])
+            for extra in chunks[1:]:
+                await m.reply_text(extra)
+
+    except ProcessCancelledException:
+        pass
+    except Exception as e:
+        logging.exception("Error in process_pwwp_today:")
+        try:
+            await editable.edit(f"**Error : {e}**")
+        except Exception:
+            pass
+
+
+def pwwp_menu_buttons() -> InlineKeyboardMarkup:
+    """Use this wherever your PW menu is shown."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Extract Batch", callback_data="pwwp")],
+        [InlineKeyboardButton("📅 Today's Class", callback_data="pwwp_today")],
+    ])
+
+
 def register_pwwp_handlers(bot: Client):
 
     # Captures user text input for prompt_user/ask_user
@@ -791,4 +1071,13 @@ def register_pwwp_handlers(bot: Client):
 
         asyncio.create_task(
             process_pwwp(client, callback_query.message, user_id)
+        )
+
+    @bot.on_callback_query(filters.regex("^pwwp_today$"))
+    async def pwwp_today_callback(client: Client, callback_query):
+        user_id = callback_query.from_user.id
+        await callback_query.answer()
+
+        asyncio.create_task(
+            process_pwwp_today(client, callback_query.message, user_id)
         )
