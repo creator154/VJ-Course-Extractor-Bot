@@ -6,55 +6,17 @@ import random
 import time
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import aiohttp
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import Message
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-
-# ---------------- RATE LIMIT SETTINGS (tune here) ----------------
-MAX_CONCURRENCY = 4          # parallel requests at a time
-MIN_REQUEST_INTERVAL = 0.25  # min seconds between any two requests (~4 req/s)
-MAX_RETRIES = 6              # retries per request
-BASE_BACKOFF = 2.0           # exponential backoff base (seconds)
-MAX_BACKOFF = 60.0           # cap for a single wait
-# -----------------------------------------------------------------
-
-SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
+from helpers import ask_user, extract_url_from_video_details, is_authorized
 
 
-class RateLimiter:
-    """Global limiter: spaces out requests and supports a shared cooldown
-    when the server answers 429, so ALL tasks slow down together."""
-
-    def __init__(self, min_interval: float):
-        self.min_interval = min_interval
-        self._lock = asyncio.Lock()
-        self._next_slot = 0.0
-        self._pause_until = 0.0
-
-    async def wait(self):
-        async with self._lock:
-            now = time.monotonic()
-            start = max(now, self._next_slot, self._pause_until)
-            self._next_slot = start + self.min_interval
-        delay = start - now
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-    def pause(self, seconds: float):
-        self._pause_until = max(self._pause_until, time.monotonic() + seconds)
-
-
-RATE_LIMITER = RateLimiter(MIN_REQUEST_INTERVAL)
-
-# User response tracking dictionary for built-in ask_user
-USER_RESPONSES: Dict[int, str] = {}
-USER_EVENTS: Dict[int, asyncio.Event] = {}
+# Reduced concurrency to avoid PW API HTTP 429 Rate Limiting
+SEMAPHORE = asyncio.Semaphore(2)
 
 
 class ProcessCancelledException(Exception):
@@ -66,56 +28,11 @@ def format_time(seconds: float) -> str:
     seconds = int(seconds)
     mins, secs = divmod(seconds, 60)
     hrs, mins = divmod(mins, 60)
+
     if hrs > 0:
         return f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
     return f"{mins:02d}m {secs:02d}s"
-
-
-def extract_url_from_video_details(item: Dict) -> str:
-    """Built-in video URL extractor for PW PenPencil API responses."""
-    if not item or not isinstance(item, dict):
-        return ""
-
-    vd = item.get("videoDetails", {}) or {}
-    if vd:
-        url = (
-            vd.get("videoUrl")
-            or vd.get("hlsUrl")
-            or vd.get("mpdUrl")
-            or vd.get("url")
-            or ""
-        )
-        if url:
-            return url
-
-    direct_url = item.get("url") or item.get("videoUrl") or ""
-    return direct_url
-
-
-async def ask_user(
-    bot: Client,
-    message: Message,
-    editable: Message,
-    text: str,
-    user_id: int,
-    timeout: int = 300
-) -> Optional[str]:
-    """Built-in helper to wait for user text input via Telegram."""
-    event = asyncio.Event()
-    USER_EVENTS[user_id] = event
-    USER_RESPONSES[user_id] = None
-
-    await editable.edit(text)
-
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-        response = USER_RESPONSES.get(user_id)
-        return response
-    except asyncio.TimeoutError:
-        return None
-    finally:
-        USER_EVENTS.pop(user_id, None)
-        USER_RESPONSES.pop(user_id, None)
 
 
 async def prompt_user(
@@ -125,12 +42,19 @@ async def prompt_user(
     text: str,
     user_id: int
 ) -> str:
+
     cancel_notice = (
         "\n\n"
         "<blockquote>❌ **Send `/cancel` at any time to abort this process.**</blockquote>"
     )
 
-    response = await ask_user(bot, message, editable, text + cancel_notice, user_id)
+    response = await ask_user(
+        bot,
+        message,
+        editable,
+        text + cancel_notice,
+        user_id
+    )
 
     if response is None or response.strip().lower() == "/cancel":
         await editable.edit("**Process Cancelled by User ❌**")
@@ -159,11 +83,16 @@ async def update_status_card(
         eta_str = "Calculating..."
 
     filled_blocks = int(percentage // 10)
-    progress_bar = "▓" * filled_blocks + "░" * (10 - filled_blocks)
+
+    progress_bar = (
+        "▓" * filled_blocks +
+        "░" * (10 - filled_blocks)
+    )
 
     status_text = (
         f"<blockquote>⚙️ **Processing Task:** `{task_name}`</blockquote>\n\n"
-        f"📊 **Progress:** [{progress_bar}] `{percentage:.1f}%` ({current}/{total})\n"
+        f"📊 **Progress:** [{progress_bar}] "
+        f"`{percentage:.1f}%` ({current}/{total})\n"
         f"📌 **Current Activity:** {activity}\n"
         f"⏱️ **Time Elapsed:** `{format_time(elapsed)}`\n"
         f"⏳ **Time Left (ETA):** `{eta_str}`\n\n"
@@ -176,25 +105,6 @@ async def update_status_card(
         pass
 
 
-def _backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
-    """Server's Retry-After wins; otherwise exponential backoff + jitter."""
-    if retry_after is not None and retry_after > 0:
-        delay = retry_after
-    else:
-        delay = BASE_BACKOFF * (2 ** attempt)
-    delay = min(delay, MAX_BACKOFF)
-    return delay + random.uniform(0, 1)
-
-
-def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
 async def fetch_pwwp_data(
     session: aiohttp.ClientSession,
     url: str,
@@ -203,90 +113,110 @@ async def fetch_pwwp_data(
     data: Dict = None,
     method: str = "GET"
 ) -> Any:
-    """Request with global throttling, 429 handling and backoff.
-    The semaphore is held only during the request itself, never while sleeping."""
 
-    for attempt in range(MAX_RETRIES):
-        wait_for = 0.0  # >0 means: retry after sleeping this long
+    async with SEMAPHORE:
+        # Throttle delay to prevent rapid burst firing
+        await asyncio.sleep(0.5)
 
-        try:
-            async with SEMAPHORE:
-                await RATE_LIMITER.wait()
-
+        for attempt in range(5):
+            try:
                 async with session.request(
-                    method, url, headers=headers, params=params, json=data
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=data
                 ) as response:
-                    status = response.status
+
                     response_body = await response.text()
-                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
 
-            logging.info(
-                "PWWP API | method=%s | status=%s | endpoint=%s",
-                method, status, url
-            )
+                    logging.info(
+                        "PWWP API | method=%s | status=%s | endpoint=%s",
+                        method,
+                        response.status,
+                        url
+                    )
 
-            if status == 401:
-                logging.error("PWWP AUTH FAILED | endpoint=%s", url)
-                return {
-                    "_auth_error": True,
-                    "_status": 401,
-                    "_response": response_body
-                }
+                    if response.status == 401:
+                        logging.error(
+                            "PWWP AUTH FAILED | endpoint=%s",
+                            url
+                        )
+                        logging.error(
+                            "PWWP AUTH RESPONSE | %s",
+                            response_body[:1000]
+                        )
+                        return {
+                            "_auth_error": True,
+                            "_status": 401,
+                            "_response": response_body
+                        }
 
-            if status in (429, 503):
-                wait_for = _backoff_delay(attempt, retry_after)
-                RATE_LIMITER.pause(wait_for)  # slow down ALL tasks
-                logging.warning(
-                    "PWWP RATE LIMITED | status=%s | attempt=%s | waiting %.1fs | endpoint=%s",
-                    status, attempt + 1, wait_for, url
-                )
+                    # HTTP 429 Rate Limit Handling
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after and retry_after.isdigit():
+                            backoff = float(retry_after)
+                        else:
+                            backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
 
-            elif status >= 500:
-                wait_for = _backoff_delay(attempt)
+                        logging.warning(
+                            "PWWP 429 RATE LIMITED | attempt=%s | backoff=%.2fs | endpoint=%s",
+                            attempt + 1,
+                            backoff,
+                            url
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+
+                    if response.status >= 400:
+                        logging.error(
+                            "PWWP API ERROR | attempt=%s | status=%s | endpoint=%s",
+                            attempt + 1,
+                            response.status,
+                            url
+                        )
+                        logging.error(
+                            "PWWP API RESPONSE | %s",
+                            response_body[:1000]
+                        )
+                        if attempt < 4:
+                            await asyncio.sleep(2 ** attempt)
+                        continue
+
+                    try:
+                        return json.loads(response_body)
+                    except json.JSONDecodeError:
+                        logging.error(
+                            "PWWP INVALID JSON | endpoint=%s | response=%s",
+                            url,
+                            response_body[:1000]
+                        )
+                        return None
+
+            except asyncio.TimeoutError:
                 logging.error(
-                    "PWWP SERVER ERROR | attempt=%s | status=%s | endpoint=%s",
-                    attempt + 1, status, url
+                    "PWWP TIMEOUT | attempt=%s | endpoint=%s",
+                    attempt + 1,
+                    url
+                )
+            except aiohttp.ClientError as e:
+                logging.error(
+                    "PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s",
+                    attempt + 1,
+                    url,
+                    str(e)
+                )
+            except Exception:
+                logging.exception(
+                    "PWWP UNEXPECTED ERROR | endpoint=%s",
+                    url
                 )
 
-            elif status >= 400:
-                # 403/404 etc. will not fix themselves, don't hammer the API
-                logging.error("PWWP CLIENT ERROR | status=%s | endpoint=%s", status, url)
-                return None
+            if attempt < 4:
+                await asyncio.sleep(2 ** attempt)
 
-            else:
-                try:
-                    return json.loads(response_body)
-                except json.JSONDecodeError:
-                    return None
-
-        except asyncio.TimeoutError:
-            logging.error("PWWP TIMEOUT | attempt=%s | endpoint=%s", attempt + 1, url)
-            wait_for = _backoff_delay(attempt)
-        except aiohttp.ClientError as e:
-            logging.error("PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s", attempt + 1, url, str(e))
-            wait_for = _backoff_delay(attempt)
-        except Exception:
-            logging.exception("PWWP UNEXPECTED ERROR | endpoint=%s", url)
-            wait_for = _backoff_delay(attempt)
-
-        if attempt < MAX_RETRIES - 1 and wait_for > 0:
-            await asyncio.sleep(wait_for)
-
-    logging.error("PWWP GAVE UP after %s attempts | endpoint=%s", MAX_RETRIES, url)
-    return None
-
-
-# Cache so the same schedule-details is never fetched twice
-# (same item can show up in several chapters / content types).
-_DETAILS_CACHE: Dict[str, "asyncio.Future"] = {}
-
-
-async def get_schedule_details(session, url: str, headers: Dict):
-    fut = _DETAILS_CACHE.get(url)
-    if fut is None:
-        fut = asyncio.ensure_future(fetch_pwwp_data(session, url, headers=headers))
-        _DETAILS_CACHE[url] = fut
-    return await asyncio.shield(fut)
+        return None
 
 
 async def process_pwwp_chapter_content(
@@ -304,38 +234,72 @@ async def process_pwwp_chapter_content(
         f"{schedule_id}/schedule-details"
     )
 
-    data = await get_schedule_details(session, url, headers)
+    data = await fetch_pwwp_data(
+        session,
+        url,
+        headers=headers
+    )
+
     content = []
 
-    if data and not data.get("_auth_error") and data.get("success") and data.get("data"):
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
+
         item = data["data"]
         topic = item.get("topic", "")
 
-        # 1. Video extraction
-        if content_type in ("videos", "dppVideos", "DppVideos"):
+        if content_type in ("videos", "DppVideos"):
+
             video_url = extract_url_from_video_details(item)
+
             if video_url:
-                content.append(f"{topic}:{video_url}")
-
-        # 2. Notes / PDFs extraction
-        if content_type in ("notes", "dppNotes", "DppNotes", "videos", "dppVideos"):
-            for att in item.get("attachments", []) or []:
-                u = att.get("url") or att.get("fileUrl") or (
-                    (att.get("baseUrl") or "") + (att.get("key") or "")
+                content.append(
+                    f"{topic}:{video_url}"
                 )
-                if u:
-                    content.append(f"{topic}:{u}")
+            else:
+                for hw in item.get("homeworkIds", []) or []:
+                    hw_topic = hw.get("topic", topic)
+                    for att in hw.get("attachmentIds", []) or []:
+                        u = (
+                            att.get("url")
+                            or att.get("attachmentUrl")
+                            or (att.get("baseUrl", "") + att.get("key", ""))
+                        )
 
-            for hw in item.get("homeworkIds", []) or []:
+                        if u and not u.endswith(".pdf"):
+                            content.append(
+                                f"{hw_topic}:{u}"
+                            )
+
+        elif content_type in ("notes", "DppNotes"):
+
+            homeworks = item.get("homeworkIds", []) or []
+            if not homeworks and item.get("dpp"):
+                homeworks = item.get("dpp", {}).get("homeworkIds", []) or []
+
+            for hw in homeworks:
                 hw_topic = hw.get("topic", topic)
-                for att in (hw.get("attachmentIds", []) or hw.get("attachments", []) or []):
-                    u = att.get("url") or att.get("fileUrl") or (
-                        (att.get("baseUrl") or "") + (att.get("key") or "")
+                for att in hw.get("attachmentIds", []) or []:
+                    u = (
+                        att.get("url")
+                        or att.get("attachmentUrl")
+                        or (att.get("baseUrl", "") + att.get("key", ""))
                     )
-                    if u:
-                        content.append(f"{hw_topic}:{u}")
 
-    return {content_type: content} if content else {}
+                    if u:
+                        content.append(
+                            f"{hw_topic}:{u}"
+                        )
+
+    return (
+        {content_type: content}
+        if content
+        else {}
+    )
 
 
 async def fetch_pwwp_all_schedule(
@@ -351,35 +315,66 @@ async def fetch_pwwp_all_schedule(
     page = 1
 
     while True:
+
         url = (
             f"https://api.penpencil.co/v2/batches/"
             f"{selected_batch_id}/subject/{subject_id}/contents"
         )
 
         params = {
-            "topicId": chapter_id,
+            "tag": chapter_id,
             "contentType": content_type,
             "page": page
         }
 
-        data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+        data = await fetch_pwwp_data(
+            session,
+            url,
+            headers=headers,
+            params=params
+        )
 
-        if data and not data.get("_auth_error") and data.get("success") and data.get("data"):
-            items = data["data"]
-            if not items:
-                break
+        if (
+            data
+            and not data.get("_auth_error")
+            and data.get("success")
+            and data.get("data")
+        ):
 
-            for item in items:
+            for item in data["data"]:
+
                 item["content_type"] = content_type
 
-                if content_type in ("videos", "dppVideos"):
+                # Videos direct URL extraction
+                if content_type in ("videos", "DppVideos"):
                     direct_url = extract_url_from_video_details(item)
                     if direct_url:
                         item["_pre_extracted_url"] = direct_url
 
+                # Notes & DPP Notes Direct Extraction (Fix for PW new API)
+                if content_type in ("notes", "DppNotes"):
+                    attachments = item.get("attachmentIds", []) or []
+                    if not attachments and item.get("homeworkIds"):
+                        for hw in item.get("homeworkIds", []) or []:
+                            attachments.extend(hw.get("attachmentIds", []) or [])
+
+                    extracted_notes = []
+                    for att in attachments:
+                        u = (
+                            att.get("url")
+                            or att.get("attachmentUrl")
+                            or (att.get("baseUrl", "") + att.get("key", ""))
+                        )
+                        if u:
+                            extracted_notes.append(u)
+
+                    if extracted_notes:
+                        item["_pre_extracted_notes"] = extracted_notes
+
                 all_schedules.append(item)
 
             page += 1
+
         else:
             break
 
@@ -391,58 +386,118 @@ async def process_pwwp_chapters(
     chapter_id: str,
     selected_batch_id: str,
     subject_id: str,
-    headers: Dict,
-    allowed_content_types: List[str]
+    headers: Dict
 ) -> Dict[str, List[str]]:
+
+    content_types = [
+        "videos",
+        "notes",
+        "DppNotes",
+        "DppVideos"
+    ]
 
     all_schedules = await asyncio.gather(
         *[
             fetch_pwwp_all_schedule(
-                session, chapter_id, selected_batch_id, subject_id, ct, headers
+                session,
+                chapter_id,
+                selected_batch_id,
+                subject_id,
+                ct,
+                headers
             )
-            for ct in allowed_content_types
+            for ct in content_types
         ]
     )
 
-    flat_schedule = []
-    seen = set()
-    for sublist in all_schedules:
-        for s in sublist:
-            key = (s.get("_id"), s.get("content_type"))
-            if key in seen:
-                continue
-            seen.add(key)
-            flat_schedule.append(s)
+    flat_schedule = [
+        s
+        for sublist in all_schedules
+        for s in sublist
+    ]
+
     tasks = []
 
     for item in flat_schedule:
+
         sid = item["_id"]
         ct = item["content_type"]
 
-        if ct in ("videos", "dppVideos") and item.get("_pre_extracted_url"):
-            async def _direct(c_type=ct, name=item.get("topic", sid), url=item["_pre_extracted_url"]):
-                return {c_type: [f"{name}:{url}"]}
-            tasks.append(_direct())
+        # Direct Video extraction
+        if (
+            ct in ("videos", "DppVideos")
+            and item.get("_pre_extracted_url")
+        ):
+
+            async def _direct_vid(
+                c_type=ct,
+                name=item.get("topic", sid),
+                url=item["_pre_extracted_url"]
+            ):
+                return {
+                    c_type: [
+                        f"{name}:{url}"
+                    ]
+                }
+
+            tasks.append(_direct_vid())
+
+        # Direct Notes extraction (Fix for PW new API)
+        elif (
+            ct in ("notes", "DppNotes")
+            and item.get("_pre_extracted_notes")
+        ):
+
+            async def _direct_notes(
+                c_type=ct,
+                name=item.get("topic", sid),
+                urls=item["_pre_extracted_notes"]
+            ):
+                formatted = [f"{name}:{u}" for u in urls]
+                return {c_type: formatted}
+
+            tasks.append(_direct_notes())
+
         else:
+
             tasks.append(
                 process_pwwp_chapter_content(
-                    session, selected_batch_id, subject_id, sid, ct, headers
+                    session,
+                    selected_batch_id,
+                    subject_id,
+                    sid,
+                    ct,
+                    headers
                 )
             )
 
     if not tasks:
         return {}
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(
+        *tasks,
+        return_exceptions=True
+    )
+
     combined = {}
 
     for res in results:
+
         if isinstance(res, Exception):
-            logging.error("Chapter content error: %s", res)
+
+            logging.error(
+                "Chapter content error: %s",
+                res
+            )
+
             continue
 
         for c_type, c_list in res.items():
-            combined.setdefault(c_type, []).extend(c_list)
+
+            combined.setdefault(
+                c_type,
+                []
+            ).extend(c_list)
 
     return combined
 
@@ -458,17 +513,35 @@ async def get_pwwp_all_chapters(
     page = 1
 
     while True:
-        url = f"https://api.penpencil.co/v2/batches/{selected_batch_id}/subject/{subject_id}/topics"
-        params = {"page": page}
 
-        data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+        url = (
+            f"https://api.penpencil.co/v2/batches/"
+            f"{selected_batch_id}/subject/{subject_id}/topics"
+        )
 
-        if data and not data.get("_auth_error") and data.get("data"):
-            items = data["data"]
-            if not items:
-                break
-            chapters.extend(items)
+        params = {
+            "page": page
+        }
+
+        data = await fetch_pwwp_data(
+            session,
+            url,
+            headers=headers,
+            params=params
+        )
+
+        if (
+            data
+            and not data.get("_auth_error")
+            and data.get("data")
+        ):
+
+            chapters.extend(
+                data["data"]
+            )
+
             page += 1
+
         else:
             break
 
@@ -483,51 +556,93 @@ async def process_pwwp_subject(
     zipf: zipfile.ZipFile,
     json_data: Dict,
     all_subject_urls: Dict[str, List[str]],
-    headers: Dict,
-    allowed_content_types: List[str]
+    headers: Dict
 ):
 
-    subject_name = subject.get("subject", "Unknown Subject").replace("/", "-")
+    subject_name = (
+        subject.get(
+            "subject",
+            "Unknown Subject"
+        )
+        .replace("/", "-")
+    )
+
     subject_id = subject.get("_id")
 
     json_data[selected_batch_name][subject_name] = {}
-    zipf.writestr(f"{subject_name}/", "")
 
-    chapters = await get_pwwp_all_chapters(session, selected_batch_id, subject_id, headers)
+    zipf.writestr(
+        f"{subject_name}/",
+        ""
+    )
+
+    chapters = await get_pwwp_all_chapters(
+        session,
+        selected_batch_id,
+        subject_id,
+        headers
+    )
+
     if not chapters:
         return
 
-    # Chapters are processed in small groups instead of all at once,
-    # so we don't queue thousands of requests in one burst.
-    CHAPTER_BATCH = 3
-    results: List[Any] = []
-
-    for i in range(0, len(chapters), CHAPTER_BATCH):
-        group = chapters[i:i + CHAPTER_BATCH]
-        group_results = await asyncio.gather(
-            *[
-                process_pwwp_chapters(
-                    session, ch["_id"], selected_batch_id, subject_id, headers, allowed_content_types
-                )
-                for ch in group
-            ],
-            return_exceptions=True
-        )
-        results.extend(group_results)
+    results = await asyncio.gather(
+        *[
+            process_pwwp_chapters(
+                session,
+                ch["_id"],
+                selected_batch_id,
+                subject_id,
+                headers
+            )
+            for ch in chapters
+        ],
+        return_exceptions=True
+    )
 
     all_urls = []
 
-    for ch, content_map in zip(chapters, results):
+    for ch, content_map in zip(
+        chapters,
+        results
+    ):
+
         if isinstance(content_map, Exception):
-            logging.error("Chapter failed: %s", content_map)
+
+            logging.error(
+                "Chapter failed: %s",
+                content_map
+            )
+
             continue
 
-        ch_name = ch.get("name", "Unknown Chapter").replace("/", "-")
-        json_data[selected_batch_name][subject_name][ch_name] = {}
+        ch_name = (
+            ch.get(
+                "name",
+                "Unknown Chapter"
+            )
+            .replace("/", "-")
+        )
 
-        for c_type in allowed_content_types:
+        json_data[
+            selected_batch_name
+        ][
+            subject_name
+        ][
+            ch_name
+        ] = {}
+
+        for c_type in [
+            "videos",
+            "notes",
+            "DppNotes",
+            "DppVideos"
+        ]:
+
             if content_map.get(c_type):
+
                 c_list = content_map[c_type]
+
                 c_list.reverse()
 
                 zipf.writestr(
@@ -535,13 +650,182 @@ async def process_pwwp_subject(
                     "\n".join(c_list).encode("utf-8")
                 )
 
-                json_data[selected_batch_name][subject_name][ch_name][c_type] = c_list
+                json_data[
+                    selected_batch_name
+                ][
+                    subject_name
+                ][
+                    ch_name
+                ][c_type] = c_list
+
                 all_urls.extend(c_list)
 
-    all_subject_urls[subject_name] = all_urls
+    all_subject_urls[
+        subject_name
+    ] = all_urls
 
 
-async def process_pwwp(bot: Client, m: Message, user_id: int):
+async def get_pwwp_todays_schedule_content_details(
+    session: aiohttp.ClientSession,
+    selected_batch_id: str,
+    subject_id: str,
+    schedule_id: str,
+    headers: Dict
+) -> List[str]:
+
+    url = (
+        f"https://api.penpencil.co/v1/batches/"
+        f"{selected_batch_id}/subject/{subject_id}/schedule/"
+        f"{schedule_id}/schedule-details"
+    )
+
+    data = await fetch_pwwp_data(
+        session,
+        url,
+        headers=headers
+    )
+
+    content = []
+
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
+
+        item = data["data"]
+
+        name = item.get(
+            "topic",
+            ""
+        )
+
+        v_url = extract_url_from_video_details(
+            item
+        )
+
+        if v_url:
+
+            content.append(
+                f"{name}:{v_url}\n"
+            )
+
+        else:
+
+            for hw in item.get(
+                "homeworkIds",
+                []
+            ) or []:
+
+                for att in hw.get(
+                    "attachmentIds",
+                    []
+                ) or []:
+
+                    u = (
+                        att.get("url")
+                        or att.get("attachmentUrl")
+                        or (att.get("baseUrl", "") + att.get("key", ""))
+                    )
+
+                    if u and not u.endswith(".pdf"):
+
+                        content.append(
+                            f"{hw.get('topic', name)}:{u}\n"
+                        )
+
+        for hw in (
+            item.get("dpp") or {}
+        ).get(
+            "homeworkIds",
+            []
+        ) or []:
+
+            for att in hw.get(
+                "attachmentIds",
+                []
+            ) or []:
+
+                u = (
+                    att.get("url")
+                    or att.get("attachmentUrl")
+                    or (att.get("baseUrl", "") + att.get("key", ""))
+                )
+
+                if u:
+
+                    content.append(
+                        f"{hw.get('topic', name)}:{u}\n"
+                    )
+
+    return content
+
+
+async def get_pwwp_all_todays_schedule_content(
+    session: aiohttp.ClientSession,
+    selected_batch_id: str,
+    headers: Dict,
+    editable: Message,
+    start_time: float
+) -> List[str]:
+
+    url = (
+        f"https://api.penpencil.co/v1/batches/"
+        f"{selected_batch_id}/todays-schedule"
+    )
+
+    data = await fetch_pwwp_data(
+        session,
+        url,
+        headers=headers
+    )
+
+    all_content = []
+
+    if (
+        data
+        and not data.get("_auth_error")
+        and data.get("success")
+        and data.get("data")
+    ):
+
+        schedules = data["data"]
+        total_items = len(schedules)
+
+        for idx, item in enumerate(schedules):
+
+            await update_status_card(
+                editable=editable,
+                task_name="Fetching Today's Schedule",
+                current=idx + 1,
+                total=total_items,
+                start_time=start_time,
+                activity=(
+                    f"Fetching class details "
+                    f"({idx + 1}/{total_items})"
+                )
+            )
+
+            res = await get_pwwp_todays_schedule_content_details(
+                session,
+                selected_batch_id,
+                item.get("batchSubjectId"),
+                item.get("_id"),
+                headers
+            )
+
+            all_content.extend(res)
+
+    return all_content
+
+
+async def process_pwwp(
+    bot: Client,
+    m: Message,
+    user_id: int
+):
+
     api_headers = {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -558,44 +842,90 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
         "x-sdk-version": "0.0.25",
     }
 
-    _DETAILS_CACHE.clear()
-    base_payload = {"organizationId": "5eb393ee95fab7468a79d189"}
-    editable = await m.reply_text("**Wait initializing process... ⏳**")
+    base_payload = {
+        "organizationId": "5eb393ee95fab7468a79d189"
+    }
+
+    editable = await m.reply_text(
+        "**Wait initializing process... ⏳**"
+    )
+
     clean_name = None
 
     try:
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60)
         ) as session:
 
             raw_input = await prompt_user(
-                bot, m, editable,
-                "**Enter Your Account Access Token or Phone Number:**",
+                bot,
+                m,
+                editable,
+                (
+                    "**Enter Your Account Access Token "
+                    "or Phone Number**"
+                ),
                 user_id
             )
 
             access_token = None
 
-            # Phone Login
+            # ---------------------------------
+            # PHONE LOGIN
+            # ---------------------------------
+
             if raw_input.isdigit() and len(raw_input) == 10:
-                otp_payload = {**base_payload, "username": raw_input, "countryCode": "+91"}
-                await editable.edit("**Sending OTP to registered phone... ⏳**")
+
+                otp_payload = {
+                    **base_payload,
+                    "username": raw_input,
+                    "countryCode": "+91"
+                }
+
+                await editable.edit(
+                    "**Sending OTP to registered phone... ⏳**"
+                )
 
                 async with session.post(
                     "https://api.penpencil.co/v1/users/get-otp-secure?smsType=0",
-                    headers={**api_headers, "randomid": str(uuid.uuid4())},
+                    headers={
+                        **api_headers,
+                        "randomid": str(uuid.uuid4())
+                    },
                     json=otp_payload
                 ) as resp:
-                    if resp.status == 429:
-                        await editable.edit("**Too many OTP requests ⏳ Please wait a few minutes and try again.**")
-                        return
+
                     if resp.status >= 400:
-                        await editable.edit("**OTP Request Failed ❌**")
+
+                        error_text = await resp.text()
+
+                        logging.error(
+                            "PW OTP ERROR | status=%s | response=%s",
+                            resp.status,
+                            error_text[:1000]
+                        )
+
+                        await editable.edit(
+                            "**OTP Request Failed ❌**"
+                        )
+
                         return
 
-                otp = await prompt_user(bot, m, editable, "**Enter OTP received on phone:**", user_id)
+                otp = await prompt_user(
+                    bot,
+                    m,
+                    editable,
+                    "**Enter OTP received on phone:**",
+                    user_id
+                )
+
                 if not otp.isdigit():
-                    await editable.edit("**Invalid OTP format! ❌**")
+
+                    await editable.edit(
+                        "**Invalid OTP format! ❌**"
+                    )
+
                     return
 
                 token_payload = {
@@ -608,476 +938,601 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                     "otp": str(otp)
                 }
 
-                await editable.edit("**Verifying OTP... ⏳**")
+                await editable.edit(
+                    "**Verifying OTP... ⏳**"
+                )
 
                 async with session.post(
                     "https://api.penpencil.co/v3/oauth/token",
-                    headers={**api_headers, "randomid": str(uuid.uuid4())},
+                    headers={
+                        **api_headers,
+                        "randomid": str(uuid.uuid4())
+                    },
                     json=token_payload
                 ) as resp:
-                    if resp.status == 429:
-                        await editable.edit("**Too many attempts ⏳ Please wait a few minutes and try again.**")
-                        return
+
                     if resp.status >= 400:
-                        await editable.edit("**Login Failed ❌**")
+
+                        error_text = await resp.text()
+
+                        logging.error(
+                            "PW TOKEN ERROR | status=%s | response=%s",
+                            resp.status,
+                            error_text[:1000]
+                        )
+
+                        await editable.edit(
+                            "**Login Failed ❌**"
+                        )
+
                         return
-                    res_data = await resp.json() if resp.status == 200 else {}
-                    access_token = res_data.get("data", {}).get("access_token")
 
-                if not access_token:
-                    await editable.edit("**Login Failed ❌ Invalid response.**")
-                    return
+                    try:
+                        res_data = await resp.json()
+                    except Exception:
+                        res_data = {}
 
-                await editable.edit("**PW Login Successful ✅ Token generated.**")
+                    access_token = (
+                        res_data
+                        .get("data", {})
+                        .get("access_token")
+                    )
+
+                    if not access_token:
+
+                        await editable.edit(
+                            "**Login Failed ❌ Invalid response.**"
+                        )
+
+                        return
+
+                await editable.edit(
+                    "**PW Login Successful ✅**\n"
+                    "Token generated."
+                )
+
+            # ---------------------------------
+            # TOKEN LOGIN
+            # ---------------------------------
 
             else:
+
                 access_token = raw_input.strip()
+
                 if access_token.lower().startswith("bearer "):
+
                     access_token = access_token[7:].strip()
 
             if not access_token:
-                await editable.edit("**Invalid Access Token ❌**")
+
+                await editable.edit(
+                    "**Invalid Access Token ❌**"
+                )
+
                 return
 
-            auth_headers = {**api_headers, "authorization": f"Bearer {access_token}"}
+            logging.info(
+                "PW AUTH READY | token_present=%s | token_length=%s",
+                bool(access_token),
+                len(access_token)
+            )
 
-            # Batch Search
-            batch_search = await prompt_user(bot, m, editable, "**Enter Batch Name to Search:**", user_id)
-            await editable.edit("**Searching courses online... 🔍**")
+            auth_headers = {
+                **api_headers,
+                "authorization": f"Bearer {access_token}"
+            }
+
+            # ---------------------------------
+            # BATCH SEARCH
+            # ---------------------------------
+
+            batch_search = await prompt_user(
+                bot,
+                m,
+                editable,
+                "**Enter Batch Name to Search:**",
+                user_id
+            )
+
+            await editable.edit(
+                "**Searching courses online... 🔍**"
+            )
 
             courses_res = await fetch_pwwp_data(
                 session,
                 "https://api.penpencil.co/v3/batches/search",
                 headers=auth_headers,
-                params={"name": batch_search}
+                params={
+                    "name": batch_search
+                }
             )
 
             if courses_res and courses_res.get("_auth_error"):
-                await editable.edit("🔐 **Authorization Failed ❌ HTTP 401**")
+
+                await editable.edit(
+                    "🔐 **Authorization Failed ❌**\n\n"
+                    "PW rejected the supplied authorized "
+                    "access token with **HTTP 401**.\n\n"
+                    "Please use a currently valid authorized token."
+                )
+
                 return
 
-            courses = courses_res.get("data", []) if courses_res else []
+            if courses_res is None:
+
+                await editable.edit(
+                    "❌ **PW API Request Failed**\n\n"
+                    "The server did not return a valid response."
+                )
+
+                return
+
+            courses = courses_res.get(
+                "data",
+                []
+            )
+
             if not courses:
-                await editable.edit("❌ **No Batches Found!**")
+
+                await editable.edit(
+                    "❌ **No Batches Found!**\n\n"
+                    "Authorization succeeded, but no matching "
+                    "batch was returned for this search."
+                )
+
                 return
 
             text_list = "\n".join(
-                [f"<blockquote>**{i + 1}.** `{c.get('name', 'Batch')}`</blockquote>" for i, c in enumerate(courses)]
+                [
+                    (
+                        f"<blockquote>**{i + 1}.** "
+                        f"`{c.get('name', 'Batch')}`"
+                        f"</blockquote>"
+                    )
+                    for i, c in enumerate(courses)
+                ]
             )
 
             idx_str = await prompt_user(
-                bot, m, editable,
-                f"**Select Course Index:**\n\n{text_list}",
+                bot,
+                m,
+                editable,
+                (
+                    "**Select Course Index:**\n\n"
+                    f"{text_list}"
+                ),
                 user_id
             )
 
-            if not idx_str.isdigit() or not (1 <= int(idx_str) <= len(courses)):
-                await editable.edit("**Invalid Selection ❌**")
+            if (
+                not idx_str.isdigit()
+                or not (
+                    1 <= int(idx_str) <= len(courses)
+                )
+            ):
+
+                await editable.edit(
+                    "**Invalid Selection ❌**"
+                )
+
                 return
 
-            selected_course = courses[int(idx_str) - 1]
-            batch_id = selected_course["_id"]
-            batch_name = selected_course.get("name", "Batch")
-            clean_name = batch_name.replace("/", "-").replace("|", "-")
+            selected_course = courses[
+                int(idx_str) - 1
+            ]
 
-            # FETCH BATCH DETAILS & CHECK PAID VS RANDOM TOKEN
-            await editable.edit("🔍 **Checking Token Permissions & Batch Subscription...**")
-            b_details = await fetch_pwwp_data(
-                session,
-                f"https://api.penpencil.co/v3/batches/{batch_id}/details",
-                headers=auth_headers
+            batch_id = selected_course["_id"]
+
+            batch_name = selected_course.get(
+                "name",
+                "Batch"
             )
 
-            batch_data = b_details.get("data", {}) if b_details else {}
-            is_purchased = batch_data.get("isPurchased", False) or batch_data.get("isEnrolled", False)
+            clean_name = (
+                batch_name
+                .replace("/", "-")
+                .replace("|", "-")
+            )
 
-            if is_purchased:
-                token_mode_str = "💎 **PAID TOKEN DETECTED**\nExtracting: **Videos + Notes + DPPs**"
-                allowed_content_types = ["videos", "notes", "dppNotes", "dppVideos"]
-            else:
-                token_mode_str = "🔓 **RANDOM / FREE TOKEN DETECTED**\nExtracting: **PDFs Only (Notes & DPP Notes)**"
-                allowed_content_types = ["notes", "dppNotes"]
+            # ---------------------------------
+            # CONTENT EXTRACTION MODE
+            # ---------------------------------
 
-            await editable.edit(f"✅ **Batch Selected:** `{batch_name}`\n\n{token_mode_str}")
-            await asyncio.sleep(2)
+            mode = await prompt_user(
+                bot,
+                m,
+                editable,
+                (
+                    "**Choose Content Extraction Mode:**\n\n"
+                    "<blockquote>**1. Full Batch**</blockquote>\n\n"
+                    "<blockquote>**2. Today's Class**</blockquote>\n\n"
+                    "<blockquote>**3. Specific Date Class**</blockquote>"
+                ),
+                user_id
+            )
+
+            if mode not in ("1", "2", "3"):
+
+                await editable.edit(
+                    "**Invalid Choice! ❌**"
+                )
+
+                return
+
+            # ---------------------------------
+            # SPECIFIC DATE INPUT
+            # ---------------------------------
+
+            if mode == "3":
+
+                date_input = await prompt_user(
+                    bot,
+                    m,
+                    editable,
+                    (
+                        "📅 **Enter Date in DD/MM/YYYY format**\n\n"
+                        "Example: `25/06/2026`\n\n"
+                        "Or send `today` for today's date\n\n"
+                        "For multiple dates use `&` separator:\n"
+                        "`25/06/2026&26/06/2026&27/06/2026`"
+                    ),
+                    user_id
+                )
+
+                from datetime import datetime
+
+                dates = [
+                    d.strip()
+                    for d in date_input.split("&")
+                    if d.strip()
+                ]
+
+                valid_dates = []
+
+                for date_value in dates:
+
+                    if date_value.lower() == "today":
+
+                        valid_dates.append("today")
+                        continue
+
+                    try:
+
+                        parsed_date = datetime.strptime(
+                            date_value,
+                            "%d/%m/%Y"
+                        )
+
+                        valid_dates.append(
+                            parsed_date.strftime("%d/%m/%Y")
+                        )
+
+                    except ValueError:
+
+                        await editable.edit(
+                            "❌ **Invalid Date Format!**\n\n"
+                            "Please use:\n"
+                            "`DD/MM/YYYY`\n\n"
+                            "Example:\n"
+                            "`25/06/2026`"
+                        )
+
+                        return
+
+                if not valid_dates:
+
+                    await editable.edit(
+                        "❌ **No valid date entered.**"
+                    )
+
+                    return
+
+                await editable.edit(
+                    "📅 **Date Selected Successfully ✅**\n\n"
+                    + "\n".join(
+                        f"• `{date}`"
+                        for date in valid_dates
+                    )
+                )
+
+                return
 
             start_time = time.time()
-            subjects = batch_data.get("subjects", [])
-            total_subjects = len(subjects)
 
-            json_data = {batch_name: {}}
-            all_urls = {}
-            zip_path = f"{clean_name}.zip"
+            # ---------------------------------
+            # FULL BATCH
+            # ---------------------------------
 
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for idx, sub in enumerate(subjects):
-                    sub_name = sub.get("subject", "Unknown")
-                    await update_status_card(
-                        editable=editable,
-                        task_name=f"Extracting: {batch_name}",
-                        current=idx,
-                        total=total_subjects,
-                        start_time=start_time,
-                        activity=f"Extracting subject: `{sub_name}`"
+            if mode == "1":
+
+                await update_status_card(
+                    editable,
+                    f"Full Batch: {batch_name}",
+                    0,
+                    100,
+                    start_time,
+                    "Fetching batch details..."
+                )
+
+                b_details = await fetch_pwwp_data(
+                    session,
+                    f"https://api.penpencil.co/v3/batches/{batch_id}/details",
+                    headers=auth_headers
+                )
+
+                if b_details and b_details.get("_auth_error"):
+
+                    await editable.edit(
+                        "🔐 **Authorization Failed ❌**\n\n"
+                        "PW rejected the authorized token "
+                        "while fetching batch details."
                     )
 
-                    await process_pwwp_subject(
-                        session,
-                        sub,
-                        batch_id,
-                        batch_name,
-                        zipf,
+                    return
+
+                subjects = (
+                    b_details
+                    .get("data", {})
+                    .get("subjects", [])
+                    if b_details
+                    else []
+                )
+
+                total_subjects = len(subjects)
+
+                json_data = {
+                    batch_name: {}
+                }
+
+                all_urls = {}
+
+                zip_path = f"{clean_name}.zip"
+
+                with zipfile.ZipFile(
+                    zip_path,
+                    "w",
+                    zipfile.ZIP_DEFLATED
+                ) as zipf:
+
+                    for idx, sub in enumerate(subjects):
+
+                        sub_name = sub.get(
+                            "subject",
+                            "Unknown"
+                        )
+
+                        await update_status_card(
+                            editable=editable,
+                            task_name=f"Extracting: {batch_name}",
+                            current=idx,
+                            total=total_subjects,
+                            start_time=start_time,
+                            activity=(
+                                f"Extracting subject: "
+                                f"`{sub_name}`"
+                            )
+                        )
+
+                        await process_pwwp_subject(
+                            session,
+                            sub,
+                            batch_id,
+                            batch_name,
+                            zipf,
+                            json_data,
+                            all_urls,
+                            auth_headers
+                        )
+
+                await update_status_card(
+                    editable=editable,
+                    task_name=f"Extracting: {batch_name}",
+                    current=total_subjects,
+                    total=total_subjects,
+                    start_time=start_time,
+                    activity="Compiling final files..."
+                )
+
+                with open(
+                    f"{clean_name}.json",
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+
+                    json.dump(
                         json_data,
-                        all_urls,
-                        auth_headers,
-                        allowed_content_types
+                        f,
+                        indent=4,
+                        ensure_ascii=False
                     )
 
-            await update_status_card(
-                editable=editable,
-                task_name=f"Extracting: {batch_name}",
-                current=total_subjects,
-                total=total_subjects,
-                start_time=start_time,
-                activity="Compiling final files..."
+                with open(
+                    f"{clean_name}.txt",
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+
+                    for sub_urls in all_urls.values():
+
+                        if sub_urls:
+
+                            f.write(
+                                "\n".join(sub_urls)
+                                + "\n"
+                            )
+
+            # ---------------------------------
+            # TODAY'S CLASS
+            # ---------------------------------
+
+            else:
+
+                today_data = (
+                    await get_pwwp_all_todays_schedule_content(
+                        session,
+                        batch_id,
+                        auth_headers,
+                        editable,
+                        start_time
+                    )
+                )
+
+                with open(
+                    f"{clean_name}.txt",
+                    "w",
+                    encoding="utf-8"
+                ) as f:
+
+                    f.writelines(today_data)
+
+            # ---------------------------------
+            # UPLOAD
+            # ---------------------------------
+
+            time_taken = format_time(
+                time.time() - start_time
             )
 
-            with open(f"{clean_name}.json", "w", encoding="utf-8") as f:
-                json.dump(json_data, f, indent=4, ensure_ascii=False)
-
-            with open(f"{clean_name}.txt", "w", encoding="utf-8") as f:
-                for sub_urls in all_urls.values():
-                    if sub_urls:
-                        f.write("\n".join(sub_urls) + "\n")
-
-            # UPLOAD TO TELEGRAM
-            time_taken = format_time(time.time() - start_time)
             caption = (
                 f"**Batch Name:** `{batch_name}`\n"
-                f"**Mode:** `{ 'Paid (Video+PDF)' if is_purchased else 'Free (PDF Only)' }`\n"
                 f"**Time Taken:** `{time_taken}`"
             )
 
-            await editable.edit("📤 **Uploading generated documents to Telegram...**")
+            await editable.edit(
+                "📤 **Uploading generated documents "
+                "to Telegram...**"
+            )
+
             uploaded_count = 0
 
-            for ext in ["txt", "zip", "json"]:
+            for ext in [
+                "txt",
+                "zip",
+                "json"
+            ]:
+
                 f_path = f"{clean_name}.{ext}"
-                if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
+
+                if (
+                    os.path.exists(f_path)
+                    and os.path.getsize(f_path) > 0
+                ):
+
                     try:
-                        with open(f_path, "rb") as doc:
-                            await m.reply_document(doc, caption=caption, file_name=f"{clean_name}.{ext}")
+
+                        with open(
+                            f_path,
+                            "rb"
+                        ) as doc:
+
+                            await m.reply_document(
+                                doc,
+                                caption=caption,
+                                file_name=f"{clean_name}.{ext}"
+                            )
+
                         uploaded_count += 1
+
                     except Exception as upload_err:
-                        logging.error("Failed to upload %s: %s", f_path, upload_err)
+
+                        logging.error(
+                            "Failed to upload %s: %s",
+                            f_path,
+                            upload_err
+                        )
+
                     finally:
+
                         if os.path.exists(f_path):
+
                             os.remove(f_path)
 
+                elif os.path.exists(f_path):
+
+                    os.remove(f_path)
+
             if uploaded_count == 0:
-                await editable.edit("**Extraction completed, but no content or links were found. ❌**")
+
+                await editable.edit(
+                    "**Extraction completed, but no "
+                    "content or links were found. "
+                    "(0 Bytes output) ❌**"
+                )
+
             else:
+
                 await editable.delete()
 
     except ProcessCancelledException:
+
         if clean_name:
-            for ext in ["txt", "zip", "json"]:
+
+            for ext in [
+                "txt",
+                "zip",
+                "json"
+            ]:
+
                 f_path = f"{clean_name}.{ext}"
+
                 if os.path.exists(f_path):
+
                     try:
                         os.remove(f_path)
                     except Exception:
                         pass
 
     except Exception as e:
-        logging.exception("Error in process_pwwp:")
+
+        logging.exception(
+            "Error in process_pwwp:"
+        )
+
         try:
-            await editable.edit(f"**Error : {e}**")
-        except Exception:
-            pass
 
-
-# ======================= TODAY'S CLASS FEATURE =======================
-
-PW_ORG_ID = "5eb393ee95fab7468a79d189"
-IST = timezone(timedelta(hours=5, minutes=30))
-
-
-def _base_api_headers() -> Dict:
-    return {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "origin": "https://www.pw.live",
-        "referer": "https://www.pw.live/",
-        "user-agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "Chrome/148.0.0.0 Safari/537.36"
-        ),
-        "client-id": PW_ORG_ID,
-        "client-type": "WEB",
-        "content-type": "application/json",
-        "randomid": str(uuid.uuid4()),
-        "x-sdk-version": "0.0.25",
-    }
-
-
-async def pw_login_flow(bot, m, editable, session, user_id, api_headers) -> Optional[Dict]:
-    """Token or phone+OTP login. Returns auth headers or None."""
-    base_payload = {"organizationId": PW_ORG_ID}
-
-    raw_input = await prompt_user(
-        bot, m, editable,
-        "**Enter Your Account Access Token or Phone Number:**",
-        user_id
-    )
-
-    if raw_input.isdigit() and len(raw_input) == 10:
-        await editable.edit("**Sending OTP to registered phone... ⏳**")
-        async with session.post(
-            "https://api.penpencil.co/v1/users/get-otp-secure?smsType=0",
-            headers={**api_headers, "randomid": str(uuid.uuid4())},
-            json={**base_payload, "username": raw_input, "countryCode": "+91"}
-        ) as resp:
-            if resp.status == 429:
-                await editable.edit("**Too many OTP requests ⏳ Wait a few minutes and try again.**")
-                return None
-            if resp.status >= 400:
-                await editable.edit("**OTP Request Failed ❌**")
-                return None
-
-        otp = await prompt_user(bot, m, editable, "**Enter OTP received on phone:**", user_id)
-        if not otp.isdigit():
-            await editable.edit("**Invalid OTP format! ❌**")
-            return None
-
-        await editable.edit("**Verifying OTP... ⏳**")
-        async with session.post(
-            "https://api.penpencil.co/v3/oauth/token",
-            headers={**api_headers, "randomid": str(uuid.uuid4())},
-            json={
-                **base_payload,
-                "client_id": "system-admin",
-                "grant_type": "password",
-                "latitude": 0,
-                "longitude": 0,
-                "username": raw_input,
-                "otp": str(otp)
-            }
-        ) as resp:
-            if resp.status >= 400:
-                await editable.edit("**Login Failed ❌**")
-                return None
-            res_data = await resp.json()
-            access_token = (res_data.get("data") or {}).get("access_token")
-
-        if not access_token:
-            await editable.edit("**Login Failed ❌ Invalid response.**")
-            return None
-    else:
-        access_token = raw_input.strip()
-        if access_token.lower().startswith("bearer "):
-            access_token = access_token[7:].strip()
-
-    if not access_token:
-        await editable.edit("**Invalid Access Token ❌**")
-        return None
-
-    return {**api_headers, "authorization": f"Bearer {access_token}"}
-
-
-async def pw_select_batch_flow(bot, m, editable, session, user_id, auth_headers) -> Optional[Dict]:
-    """Search batch by name and let user pick. Returns the selected course dict."""
-    batch_search = await prompt_user(bot, m, editable, "**Enter Batch Name to Search:**", user_id)
-    await editable.edit("**Searching courses online... 🔍**")
-
-    courses_res = await fetch_pwwp_data(
-        session,
-        "https://api.penpencil.co/v3/batches/search",
-        headers=auth_headers,
-        params={"name": batch_search}
-    )
-
-    if courses_res and courses_res.get("_auth_error"):
-        await editable.edit("🔐 **Authorization Failed ❌ HTTP 401**")
-        return None
-
-    courses = courses_res.get("data", []) if courses_res else []
-    if not courses:
-        await editable.edit("❌ **No Batches Found!**")
-        return None
-
-    text_list = "\n".join(
-        [f"<blockquote>**{i + 1}.** `{c.get('name', 'Batch')}`</blockquote>" for i, c in enumerate(courses)]
-    )
-    idx_str = await prompt_user(
-        bot, m, editable,
-        f"**Select Course Index:**\n\n{text_list}",
-        user_id
-    )
-
-    if not idx_str.isdigit() or not (1 <= int(idx_str) <= len(courses)):
-        await editable.edit("**Invalid Selection ❌**")
-        return None
-
-    return courses[int(idx_str) - 1]
-
-
-def _fmt_ist(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "--:--"
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(IST).strftime("%I:%M %p")
-    except Exception:
-        return "--:--"
-
-
-def _name_of(x: Any) -> str:
-    if isinstance(x, dict):
-        return x.get("name") or x.get("subject") or ""
-    return str(x) if x else ""
-
-
-def format_today_classes(items: List[Dict], batch_name: str) -> List[str]:
-    """Returns message chunks (<4000 chars each) for Telegram."""
-    today = datetime.now(IST).strftime("%d %b %Y")
-    header = f"📅 **Today's Classes — {today}**\n📚 `{batch_name}`\n\n"
-
-    def sort_key(it):
-        return (it.get("startTime") or "")
-
-    blocks = []
-    for n, it in enumerate(sorted(items, key=sort_key), 1):
-        topic = it.get("topic") or "Untitled"
-        subject = _name_of(it.get("subjectId")) or _name_of(it.get("subject"))
-        teachers = it.get("teacherIds") or []
-        teacher = ", ".join(filter(None, (_name_of(t) if isinstance(t, dict) else "" for t in teachers)))
-        if not teacher:
-            teacher = ""
-        if not teacher and teachers and isinstance(teachers[0], dict):
-            t0 = teachers[0]
-            teacher = ((t0.get("firstName") or "") + " " + (t0.get("lastName") or "")).strip()
-
-        status = "🔴 LIVE" if it.get("isLive") else ""
-        url = extract_url_from_video_details(it)
-
-        lines = [
-            f"**{n}. {topic}** {status}".strip(),
-            f"⏰ {_fmt_ist(it.get('startTime'))} - {_fmt_ist(it.get('endTime'))}",
-        ]
-        if subject:
-            lines.append(f"📖 {subject}")
-        if teacher:
-            lines.append(f"👨‍🏫 {teacher}")
-        if url:
-            lines.append(f"🔗 `{url}`")
-        blocks.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
-
-    chunks, cur = [], header
-    for b in blocks:
-        if len(cur) + len(b) + 2 > 3800:
-            chunks.append(cur)
-            cur = ""
-        cur += b + "\n"
-    if cur.strip():
-        chunks.append(cur)
-    return chunks
-
-
-async def process_pwwp_today(bot: Client, m: Message, user_id: int):
-    api_headers = _base_api_headers()
-    editable = await m.reply_text("**Wait initializing process... ⏳**")
-
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60)
-        ) as session:
-
-            auth_headers = await pw_login_flow(bot, m, editable, session, user_id, api_headers)
-            if not auth_headers:
-                return
-
-            course = await pw_select_batch_flow(bot, m, editable, session, user_id, auth_headers)
-            if not course:
-                return
-
-            batch_id = course["_id"]
-            batch_name = course.get("name", "Batch")
-
-            await editable.edit(f"📅 **Fetching today's classes for** `{batch_name}` ... ⏳")
-
-            res = await fetch_pwwp_data(
-                session,
-                f"https://api.penpencil.co/v1/batches/{batch_id}/todays-schedule",
-                headers=auth_headers
+            await editable.edit(
+                f"**Error : {e}**"
             )
 
-            if res and res.get("_auth_error"):
-                await editable.edit("🔐 **Authorization Failed ❌ HTTP 401**")
-                return
-
-            if not res:
-                await editable.edit("**Could not fetch today's schedule ❌ (API error, check logs).**")
-                return
-
-            data = res.get("data")
-            if isinstance(data, dict):  # some responses wrap the list
-                data = data.get("schedules") or data.get("data") or []
-            items = data or []
-
-            if not items:
-                await editable.edit(f"📭 **No classes scheduled today for** `{batch_name}`")
-                return
-
-            chunks = format_today_classes(items, batch_name)
-            await editable.edit(chunks[0])
-            for extra in chunks[1:]:
-                await m.reply_text(extra)
-
-    except ProcessCancelledException:
-        pass
-    except Exception as e:
-        logging.exception("Error in process_pwwp_today:")
-        try:
-            await editable.edit(f"**Error : {e}**")
         except Exception:
             pass
 
+        if clean_name:
 
-def pwwp_menu_buttons() -> InlineKeyboardMarkup:
-    """Use this wherever your PW menu is shown."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Extract Batch", callback_data="pwwp")],
-        [InlineKeyboardButton("📅 Today's Class", callback_data="pwwp_today")],
-    ])
+            for ext in [
+                "txt",
+                "zip",
+                "json"
+            ]:
+
+                f_path = f"{clean_name}.{ext}"
+
+                if os.path.exists(f_path):
+
+                    try:
+                        os.remove(f_path)
+                    except Exception:
+                        pass
 
 
 def register_pwwp_handlers(bot: Client):
 
-    # Captures user text input for prompt_user/ask_user
-    @bot.on_message(filters.text & ~filters.command(["start", "help"]))
-    async def capture_user_input(client: Client, message: Message):
-        user_id = message.from_user.id
-        if user_id in USER_EVENTS:
-            USER_RESPONSES[user_id] = message.text
-            USER_EVENTS[user_id].set()
+    @bot.on_callback_query(
+        filters.regex("^pwwp$")
+    )
+    async def pwwp_callback(
+        client: Client,
+        callback_query
+    ):
 
-    @bot.on_callback_query(filters.regex("^pwwp$"))
-    async def pwwp_callback(client: Client, callback_query):
         user_id = callback_query.from_user.id
+
         await callback_query.answer()
 
         asyncio.create_task(
-            process_pwwp(client, callback_query.message, user_id)
-        )
-
-    @bot.on_callback_query(filters.regex("^pwwp_today$"))
-    async def pwwp_today_callback(client: Client, callback_query):
-        user_id = callback_query.from_user.id
-        await callback_query.answer()
-
-        asyncio.create_task(
-            process_pwwp_today(client, callback_query.message, user_id)
+            process_pwwp(
+                client,
+                callback_query.message,
+                user_id
+            )
         )
