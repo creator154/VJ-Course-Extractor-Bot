@@ -35,6 +35,25 @@ def format_time(seconds: float) -> str:
     return f"{mins:02d}m {secs:02d}s"
 
 
+def extract_attachment_url(att: Dict) -> str:
+    """Helper to extract attachment/PDF URL from various response key formats."""
+    if not isinstance(att, dict):
+        return ""
+    
+    url = (
+        att.get("url")
+        or att.get("attachmentUrl")
+        or att.get("fileUrl")
+        or att.get("downloadUrl")
+    )
+    if not url and att.get("baseUrl") and att.get("key"):
+        base = att.get("baseUrl", "").rstrip("/")
+        key = att.get("key", "").lstrip("/")
+        url = f"{base}/{key}"
+    
+    return url or ""
+
+
 async def prompt_user(
     bot: Client,
     message: Message,
@@ -138,18 +157,22 @@ async def fetch_pwwp_data(
                     )
 
                     if response.status == 401:
-                        logging.error(
-                            "PWWP AUTH FAILED | endpoint=%s",
-                            url
-                        )
-                        logging.error(
-                            "PWWP AUTH RESPONSE | %s",
-                            response_body[:1000]
-                        )
+                        logging.error("PWWP AUTH FAILED | endpoint=%s", url)
+                        logging.error("PWWP AUTH RESPONSE | %s", response_body[:1000])
                         return {
                             "_auth_error": True,
                             "_status": 401,
                             "_response": response_body
+                        }
+
+                    # Fast return on 404 Not Found (e.g. Empty schedule or missing resource)
+                    if response.status == 404:
+                        logging.warning("PWWP API 404 NOT FOUND | endpoint=%s", url)
+                        return {
+                            "_404": True,
+                            "_status": 404,
+                            "success": False,
+                            "data": []
                         }
 
                     # HTTP 429 Rate Limit Handling
@@ -176,10 +199,7 @@ async def fetch_pwwp_data(
                             response.status,
                             url
                         )
-                        logging.error(
-                            "PWWP API RESPONSE | %s",
-                            response_body[:1000]
-                        )
+                        logging.error("PWWP API RESPONSE | %s", response_body[:1000])
                         if attempt < 4:
                             await asyncio.sleep(2 ** attempt)
                         continue
@@ -195,11 +215,7 @@ async def fetch_pwwp_data(
                         return None
 
             except asyncio.TimeoutError:
-                logging.error(
-                    "PWWP TIMEOUT | attempt=%s | endpoint=%s",
-                    attempt + 1,
-                    url
-                )
+                logging.error("PWWP TIMEOUT | attempt=%s | endpoint=%s", attempt + 1, url)
             except aiohttp.ClientError as e:
                 logging.error(
                     "PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s",
@@ -208,10 +224,7 @@ async def fetch_pwwp_data(
                     str(e)
                 )
             except Exception:
-                logging.exception(
-                    "PWWP UNEXPECTED ERROR | endpoint=%s",
-                    url
-                )
+                logging.exception("PWWP UNEXPECTED ERROR | endpoint=%s", url)
 
             if attempt < 4:
                 await asyncio.sleep(2 ** attempt)
@@ -234,17 +247,13 @@ async def process_pwwp_chapter_content(
         f"{schedule_id}/schedule-details"
     )
 
-    data = await fetch_pwwp_data(
-        session,
-        url,
-        headers=headers
-    )
-
+    data = await fetch_pwwp_data(session, url, headers=headers)
     content = []
 
     if (
         data
         and not data.get("_auth_error")
+        and not data.get("_404")
         and data.get("success")
         and data.get("data")
     ):
@@ -257,23 +266,14 @@ async def process_pwwp_chapter_content(
             video_url = extract_url_from_video_details(item)
 
             if video_url:
-                content.append(
-                    f"{topic}:{video_url}"
-                )
+                content.append(f"{topic}:{video_url}")
             else:
                 for hw in item.get("homeworkIds", []) or []:
                     hw_topic = hw.get("topic", topic)
                     for att in hw.get("attachmentIds", []) or []:
-                        u = (
-                            att.get("url")
-                            or att.get("attachmentUrl")
-                            or (att.get("baseUrl", "") + att.get("key", ""))
-                        )
-
+                        u = extract_attachment_url(att)
                         if u and not u.endswith(".pdf"):
-                            content.append(
-                                f"{hw_topic}:{u}"
-                            )
+                            content.append(f"{hw_topic}:{u}")
 
         elif content_type in ("notes", "DppNotes"):
 
@@ -284,22 +284,11 @@ async def process_pwwp_chapter_content(
             for hw in homeworks:
                 hw_topic = hw.get("topic", topic)
                 for att in hw.get("attachmentIds", []) or []:
-                    u = (
-                        att.get("url")
-                        or att.get("attachmentUrl")
-                        or (att.get("baseUrl", "") + att.get("key", ""))
-                    )
-
+                    u = extract_attachment_url(att)
                     if u:
-                        content.append(
-                            f"{hw_topic}:{u}"
-                        )
+                        content.append(f"{hw_topic}:{u}")
 
-    return (
-        {content_type: content}
-        if content
-        else {}
-    )
+    return {content_type: content} if content else {}
 
 
 async def fetch_pwwp_all_schedule(
@@ -337,6 +326,7 @@ async def fetch_pwwp_all_schedule(
         if (
             data
             and not data.get("_auth_error")
+            and not data.get("_404")
             and data.get("success")
             and data.get("data")
         ):
@@ -351,7 +341,7 @@ async def fetch_pwwp_all_schedule(
                     if direct_url:
                         item["_pre_extracted_url"] = direct_url
 
-                # Notes & DPP Notes Direct Extraction (Fix for PW new API)
+                # Notes & DPP Notes Direct Extraction
                 if content_type in ("notes", "DppNotes"):
                     attachments = item.get("attachmentIds", []) or []
                     if not attachments and item.get("homeworkIds"):
@@ -360,11 +350,7 @@ async def fetch_pwwp_all_schedule(
 
                     extracted_notes = []
                     for att in attachments:
-                        u = (
-                            att.get("url")
-                            or att.get("attachmentUrl")
-                            or (att.get("baseUrl", "") + att.get("key", ""))
-                        )
+                        u = extract_attachment_url(att)
                         if u:
                             extracted_notes.append(u)
 
@@ -410,12 +396,7 @@ async def process_pwwp_chapters(
         ]
     )
 
-    flat_schedule = [
-        s
-        for sublist in all_schedules
-        for s in sublist
-    ]
-
+    flat_schedule = [s for sublist in all_schedules for s in sublist]
     tasks = []
 
     for item in flat_schedule:
@@ -424,29 +405,19 @@ async def process_pwwp_chapters(
         ct = item["content_type"]
 
         # Direct Video extraction
-        if (
-            ct in ("videos", "DppVideos")
-            and item.get("_pre_extracted_url")
-        ):
+        if ct in ("videos", "DppVideos") and item.get("_pre_extracted_url"):
 
             async def _direct_vid(
                 c_type=ct,
                 name=item.get("topic", sid),
                 url=item["_pre_extracted_url"]
             ):
-                return {
-                    c_type: [
-                        f"{name}:{url}"
-                    ]
-                }
+                return {c_type: [f"{name}:{url}"]}
 
             tasks.append(_direct_vid())
 
-        # Direct Notes extraction (Fix for PW new API)
-        elif (
-            ct in ("notes", "DppNotes")
-            and item.get("_pre_extracted_notes")
-        ):
+        # Direct Notes extraction
+        elif ct in ("notes", "DppNotes") and item.get("_pre_extracted_notes"):
 
             async def _direct_notes(
                 c_type=ct,
@@ -474,30 +445,17 @@ async def process_pwwp_chapters(
     if not tasks:
         return {}
 
-    results = await asyncio.gather(
-        *tasks,
-        return_exceptions=True
-    )
-
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     combined = {}
 
     for res in results:
 
         if isinstance(res, Exception):
-
-            logging.error(
-                "Chapter content error: %s",
-                res
-            )
-
+            logging.error("Chapter content error: %s", res)
             continue
 
         for c_type, c_list in res.items():
-
-            combined.setdefault(
-                c_type,
-                []
-            ).extend(c_list)
+            combined.setdefault(c_type, []).extend(c_list)
 
     return combined
 
@@ -519,9 +477,7 @@ async def get_pwwp_all_chapters(
             f"{selected_batch_id}/subject/{subject_id}/topics"
         )
 
-        params = {
-            "page": page
-        }
+        params = {"page": page}
 
         data = await fetch_pwwp_data(
             session,
@@ -533,15 +489,11 @@ async def get_pwwp_all_chapters(
         if (
             data
             and not data.get("_auth_error")
+            and not data.get("_404")
             and data.get("data")
         ):
-
-            chapters.extend(
-                data["data"]
-            )
-
+            chapters.extend(data["data"])
             page += 1
-
         else:
             break
 
@@ -559,22 +511,11 @@ async def process_pwwp_subject(
     headers: Dict
 ):
 
-    subject_name = (
-        subject.get(
-            "subject",
-            "Unknown Subject"
-        )
-        .replace("/", "-")
-    )
-
+    subject_name = subject.get("subject", "Unknown Subject").replace("/", "-")
     subject_id = subject.get("_id")
 
     json_data[selected_batch_name][subject_name] = {}
-
-    zipf.writestr(
-        f"{subject_name}/",
-        ""
-    )
+    zipf.writestr(f"{subject_name}/", "")
 
     chapters = await get_pwwp_all_chapters(
         session,
@@ -602,47 +543,20 @@ async def process_pwwp_subject(
 
     all_urls = []
 
-    for ch, content_map in zip(
-        chapters,
-        results
-    ):
+    for ch, content_map in zip(chapters, results):
 
         if isinstance(content_map, Exception):
-
-            logging.error(
-                "Chapter failed: %s",
-                content_map
-            )
-
+            logging.error("Chapter failed: %s", content_map)
             continue
 
-        ch_name = (
-            ch.get(
-                "name",
-                "Unknown Chapter"
-            )
-            .replace("/", "-")
-        )
+        ch_name = ch.get("name", "Unknown Chapter").replace("/", "-")
 
-        json_data[
-            selected_batch_name
-        ][
-            subject_name
-        ][
-            ch_name
-        ] = {}
+        json_data[selected_batch_name][subject_name][ch_name] = {}
 
-        for c_type in [
-            "videos",
-            "notes",
-            "DppNotes",
-            "DppVideos"
-        ]:
+        for c_type in ["videos", "notes", "DppNotes", "DppVideos"]:
 
             if content_map.get(c_type):
-
                 c_list = content_map[c_type]
-
                 c_list.reverse()
 
                 zipf.writestr(
@@ -650,19 +564,10 @@ async def process_pwwp_subject(
                     "\n".join(c_list).encode("utf-8")
                 )
 
-                json_data[
-                    selected_batch_name
-                ][
-                    subject_name
-                ][
-                    ch_name
-                ][c_type] = c_list
-
+                json_data[selected_batch_name][subject_name][ch_name][c_type] = c_list
                 all_urls.extend(c_list)
 
-    all_subject_urls[
-        subject_name
-    ] = all_urls
+    all_subject_urls[subject_name] = all_urls
 
 
 async def get_pwwp_todays_schedule_content_details(
@@ -679,85 +584,35 @@ async def get_pwwp_todays_schedule_content_details(
         f"{schedule_id}/schedule-details"
     )
 
-    data = await fetch_pwwp_data(
-        session,
-        url,
-        headers=headers
-    )
-
+    data = await fetch_pwwp_data(session, url, headers=headers)
     content = []
 
     if (
         data
         and not data.get("_auth_error")
+        and not data.get("_404")
         and data.get("success")
         and data.get("data")
     ):
 
         item = data["data"]
-
-        name = item.get(
-            "topic",
-            ""
-        )
-
-        v_url = extract_url_from_video_details(
-            item
-        )
+        name = item.get("topic", "")
+        v_url = extract_url_from_video_details(item)
 
         if v_url:
-
-            content.append(
-                f"{name}:{v_url}\n"
-            )
-
+            content.append(f"{name}:{v_url}\n")
         else:
-
-            for hw in item.get(
-                "homeworkIds",
-                []
-            ) or []:
-
-                for att in hw.get(
-                    "attachmentIds",
-                    []
-                ) or []:
-
-                    u = (
-                        att.get("url")
-                        or att.get("attachmentUrl")
-                        or (att.get("baseUrl", "") + att.get("key", ""))
-                    )
-
+            for hw in item.get("homeworkIds", []) or []:
+                for att in hw.get("attachmentIds", []) or []:
+                    u = extract_attachment_url(att)
                     if u and not u.endswith(".pdf"):
+                        content.append(f"{hw.get('topic', name)}:{u}\n")
 
-                        content.append(
-                            f"{hw.get('topic', name)}:{u}\n"
-                        )
-
-        for hw in (
-            item.get("dpp") or {}
-        ).get(
-            "homeworkIds",
-            []
-        ) or []:
-
-            for att in hw.get(
-                "attachmentIds",
-                []
-            ) or []:
-
-                u = (
-                    att.get("url")
-                    or att.get("attachmentUrl")
-                    or (att.get("baseUrl", "") + att.get("key", ""))
-                )
-
+        for hw in (item.get("dpp") or {}).get("homeworkIds", []) or []:
+            for att in hw.get("attachmentIds", []) or []:
+                u = extract_attachment_url(att)
                 if u:
-
-                    content.append(
-                        f"{hw.get('topic', name)}:{u}\n"
-                    )
+                    content.append(f"{hw.get('topic', name)}:{u}\n")
 
     return content
 
@@ -770,18 +625,21 @@ async def get_pwwp_all_todays_schedule_content(
     start_time: float
 ) -> List[str]:
 
-    url = (
-        f"https://api.penpencil.co/v1/batches/"
-        f"{selected_batch_id}/todays-schedule"
-    )
+    # Primary v1 endpoint
+    url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/todays-schedule"
+    data = await fetch_pwwp_data(session, url, headers=headers)
 
-    data = await fetch_pwwp_data(
-        session,
-        url,
-        headers=headers
-    )
+    # Fallback to microservice endpoint if primary endpoint returns 404
+    if data and data.get("_404"):
+        url_fallback = f"https://api.penpencil.co/batch-service/v1/batches/{selected_batch_id}/todays-schedule"
+        data = await fetch_pwwp_data(session, url_fallback, headers=headers)
 
     all_content = []
+
+    # If no schedule scheduled today (404), safely return empty list
+    if data and data.get("_404"):
+        logging.info("No schedule found for today (404) for batch %s", selected_batch_id)
+        return all_content
 
     if (
         data
@@ -801,10 +659,7 @@ async def get_pwwp_all_todays_schedule_content(
                 current=idx + 1,
                 total=total_items,
                 start_time=start_time,
-                activity=(
-                    f"Fetching class details "
-                    f"({idx + 1}/{total_items})"
-                )
+                activity=f"Fetching class details ({idx + 1}/{total_items})"
             )
 
             res = await get_pwwp_todays_schedule_content_details(
@@ -846,10 +701,7 @@ async def process_pwwp(
         "organizationId": "5eb393ee95fab7468a79d189"
     }
 
-    editable = await m.reply_text(
-        "**Wait initializing process... ⏳**"
-    )
-
+    editable = await m.reply_text("**Wait initializing process... ⏳**")
     clean_name = None
 
     try:
@@ -862,10 +714,7 @@ async def process_pwwp(
                 bot,
                 m,
                 editable,
-                (
-                    "**Enter Your Account Access Token "
-                    "or Phone Number**"
-                ),
+                "**Enter Your Account Access Token or Phone Number**",
                 user_id
             )
 
@@ -883,9 +732,7 @@ async def process_pwwp(
                     "countryCode": "+91"
                 }
 
-                await editable.edit(
-                    "**Sending OTP to registered phone... ⏳**"
-                )
+                await editable.edit("**Sending OTP to registered phone... ⏳**")
 
                 async with session.post(
                     "https://api.penpencil.co/v1/users/get-otp-secure?smsType=0",
@@ -897,19 +744,13 @@ async def process_pwwp(
                 ) as resp:
 
                     if resp.status >= 400:
-
                         error_text = await resp.text()
-
                         logging.error(
                             "PW OTP ERROR | status=%s | response=%s",
                             resp.status,
                             error_text[:1000]
                         )
-
-                        await editable.edit(
-                            "**OTP Request Failed ❌**"
-                        )
-
+                        await editable.edit("**OTP Request Failed ❌**")
                         return
 
                 otp = await prompt_user(
@@ -921,11 +762,7 @@ async def process_pwwp(
                 )
 
                 if not otp.isdigit():
-
-                    await editable.edit(
-                        "**Invalid OTP format! ❌**"
-                    )
-
+                    await editable.edit("**Invalid OTP format! ❌**")
                     return
 
                 token_payload = {
@@ -938,9 +775,7 @@ async def process_pwwp(
                     "otp": str(otp)
                 }
 
-                await editable.edit(
-                    "**Verifying OTP... ⏳**"
-                )
+                await editable.edit("**Verifying OTP... ⏳**")
 
                 async with session.post(
                     "https://api.penpencil.co/v3/oauth/token",
@@ -952,19 +787,13 @@ async def process_pwwp(
                 ) as resp:
 
                     if resp.status >= 400:
-
                         error_text = await resp.text()
-
                         logging.error(
                             "PW TOKEN ERROR | status=%s | response=%s",
                             resp.status,
                             error_text[:1000]
                         )
-
-                        await editable.edit(
-                            "**Login Failed ❌**"
-                        )
-
+                        await editable.edit("**Login Failed ❌**")
                         return
 
                     try:
@@ -972,43 +801,25 @@ async def process_pwwp(
                     except Exception:
                         res_data = {}
 
-                    access_token = (
-                        res_data
-                        .get("data", {})
-                        .get("access_token")
-                    )
+                    access_token = res_data.get("data", {}).get("access_token")
 
                     if not access_token:
-
-                        await editable.edit(
-                            "**Login Failed ❌ Invalid response.**"
-                        )
-
+                        await editable.edit("**Login Failed ❌ Invalid response.**")
                         return
 
-                await editable.edit(
-                    "**PW Login Successful ✅**\n"
-                    "Token generated."
-                )
+                await editable.edit("**PW Login Successful ✅**\nToken generated.")
 
             # ---------------------------------
             # TOKEN LOGIN
             # ---------------------------------
 
             else:
-
                 access_token = raw_input.strip()
-
                 if access_token.lower().startswith("bearer "):
-
                     access_token = access_token[7:].strip()
 
             if not access_token:
-
-                await editable.edit(
-                    "**Invalid Access Token ❌**"
-                )
-
+                await editable.edit("**Invalid Access Token ❌**")
                 return
 
             logging.info(
@@ -1034,61 +845,42 @@ async def process_pwwp(
                 user_id
             )
 
-            await editable.edit(
-                "**Searching courses online... 🔍**"
-            )
+            await editable.edit("**Searching courses online... 🔍**")
 
             courses_res = await fetch_pwwp_data(
                 session,
                 "https://api.penpencil.co/v3/batches/search",
                 headers=auth_headers,
-                params={
-                    "name": batch_search
-                }
+                params={"name": batch_search}
             )
 
             if courses_res and courses_res.get("_auth_error"):
-
                 await editable.edit(
                     "🔐 **Authorization Failed ❌**\n\n"
-                    "PW rejected the supplied authorized "
-                    "access token with **HTTP 401**.\n\n"
+                    "PW rejected the supplied authorized access token with **HTTP 401**.\n\n"
                     "Please use a currently valid authorized token."
                 )
-
                 return
 
             if courses_res is None:
-
                 await editable.edit(
                     "❌ **PW API Request Failed**\n\n"
                     "The server did not return a valid response."
                 )
-
                 return
 
-            courses = courses_res.get(
-                "data",
-                []
-            )
+            courses = courses_res.get("data", [])
 
             if not courses:
-
                 await editable.edit(
                     "❌ **No Batches Found!**\n\n"
-                    "Authorization succeeded, but no matching "
-                    "batch was returned for this search."
+                    "Authorization succeeded, but no matching batch was returned for this search."
                 )
-
                 return
 
             text_list = "\n".join(
                 [
-                    (
-                        f"<blockquote>**{i + 1}.** "
-                        f"`{c.get('name', 'Batch')}`"
-                        f"</blockquote>"
-                    )
+                    f"<blockquote>**{i + 1}.** `{c.get('name', 'Batch')}`</blockquote>"
                     for i, c in enumerate(courses)
                 ]
             )
@@ -1097,42 +889,18 @@ async def process_pwwp(
                 bot,
                 m,
                 editable,
-                (
-                    "**Select Course Index:**\n\n"
-                    f"{text_list}"
-                ),
+                f"**Select Course Index:**\n\n{text_list}",
                 user_id
             )
 
-            if (
-                not idx_str.isdigit()
-                or not (
-                    1 <= int(idx_str) <= len(courses)
-                )
-            ):
-
-                await editable.edit(
-                    "**Invalid Selection ❌**"
-                )
-
+            if not idx_str.isdigit() or not (1 <= int(idx_str) <= len(courses)):
+                await editable.edit("**Invalid Selection ❌**")
                 return
 
-            selected_course = courses[
-                int(idx_str) - 1
-            ]
-
+            selected_course = courses[int(idx_str) - 1]
             batch_id = selected_course["_id"]
-
-            batch_name = selected_course.get(
-                "name",
-                "Batch"
-            )
-
-            clean_name = (
-                batch_name
-                .replace("/", "-")
-                .replace("|", "-")
-            )
+            batch_name = selected_course.get("name", "Batch")
+            clean_name = batch_name.replace("/", "-").replace("|", "-")
 
             # ---------------------------------
             # CONTENT EXTRACTION MODE
@@ -1152,11 +920,7 @@ async def process_pwwp(
             )
 
             if mode not in ("1", "2", "3"):
-
-                await editable.edit(
-                    "**Invalid Choice! ❌**"
-                )
-
+                await editable.edit("**Invalid Choice! ❌**")
                 return
 
             # ---------------------------------
@@ -1181,60 +945,33 @@ async def process_pwwp(
 
                 from datetime import datetime
 
-                dates = [
-                    d.strip()
-                    for d in date_input.split("&")
-                    if d.strip()
-                ]
-
+                dates = [d.strip() for d in date_input.split("&") if d.strip()]
                 valid_dates = []
 
                 for date_value in dates:
 
                     if date_value.lower() == "today":
-
                         valid_dates.append("today")
                         continue
 
                     try:
-
-                        parsed_date = datetime.strptime(
-                            date_value,
-                            "%d/%m/%Y"
-                        )
-
-                        valid_dates.append(
-                            parsed_date.strftime("%d/%m/%Y")
-                        )
-
+                        parsed_date = datetime.strptime(date_value, "%d/%m/%Y")
+                        valid_dates.append(parsed_date.strftime("%d/%m/%Y"))
                     except ValueError:
-
                         await editable.edit(
                             "❌ **Invalid Date Format!**\n\n"
-                            "Please use:\n"
-                            "`DD/MM/YYYY`\n\n"
-                            "Example:\n"
-                            "`25/06/2026`"
+                            "Please use:\n`DD/MM/YYYY`\n\nExample:\n`25/06/2026`"
                         )
-
                         return
 
                 if not valid_dates:
-
-                    await editable.edit(
-                        "❌ **No valid date entered.**"
-                    )
-
+                    await editable.edit("❌ **No valid date entered.**")
                     return
 
                 await editable.edit(
                     "📅 **Date Selected Successfully ✅**\n\n"
-                    + "\n".join(
-                        f"• `{date}`"
-                        for date in valid_dates
-                    )
+                    + "\n".join(f"• `{date}`" for date in valid_dates)
                 )
-
                 return
 
             start_time = time.time()
@@ -1261,45 +998,28 @@ async def process_pwwp(
                 )
 
                 if b_details and b_details.get("_auth_error"):
-
                     await editable.edit(
                         "🔐 **Authorization Failed ❌**\n\n"
-                        "PW rejected the authorized token "
-                        "while fetching batch details."
+                        "PW rejected the authorized token while fetching batch details."
                     )
-
                     return
 
                 subjects = (
-                    b_details
-                    .get("data", {})
-                    .get("subjects", [])
+                    b_details.get("data", {}).get("subjects", [])
                     if b_details
                     else []
                 )
 
                 total_subjects = len(subjects)
-
-                json_data = {
-                    batch_name: {}
-                }
-
+                json_data = {batch_name: {}}
                 all_urls = {}
-
                 zip_path = f"{clean_name}.zip"
 
-                with zipfile.ZipFile(
-                    zip_path,
-                    "w",
-                    zipfile.ZIP_DEFLATED
-                ) as zipf:
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
 
                     for idx, sub in enumerate(subjects):
 
-                        sub_name = sub.get(
-                            "subject",
-                            "Unknown"
-                        )
+                        sub_name = sub.get("subject", "Unknown")
 
                         await update_status_card(
                             editable=editable,
@@ -1307,10 +1027,7 @@ async def process_pwwp(
                             current=idx,
                             total=total_subjects,
                             start_time=start_time,
-                            activity=(
-                                f"Extracting subject: "
-                                f"`{sub_name}`"
-                            )
+                            activity=f"Extracting subject: `{sub_name}`"
                         )
 
                         await process_pwwp_subject(
@@ -1333,33 +1050,13 @@ async def process_pwwp(
                     activity="Compiling final files..."
                 )
 
-                with open(
-                    f"{clean_name}.json",
-                    "w",
-                    encoding="utf-8"
-                ) as f:
+                with open(f"{clean_name}.json", "w", encoding="utf-8") as f:
+                    json.dump(json_data, f, indent=4, ensure_ascii=False)
 
-                    json.dump(
-                        json_data,
-                        f,
-                        indent=4,
-                        ensure_ascii=False
-                    )
-
-                with open(
-                    f"{clean_name}.txt",
-                    "w",
-                    encoding="utf-8"
-                ) as f:
-
+                with open(f"{clean_name}.txt", "w", encoding="utf-8") as f:
                     for sub_urls in all_urls.values():
-
                         if sub_urls:
-
-                            f.write(
-                                "\n".join(sub_urls)
-                                + "\n"
-                            )
+                            f.write("\n".join(sub_urls) + "\n")
 
             # ---------------------------------
             # TODAY'S CLASS
@@ -1367,116 +1064,66 @@ async def process_pwwp(
 
             else:
 
-                today_data = (
-                    await get_pwwp_all_todays_schedule_content(
-                        session,
-                        batch_id,
-                        auth_headers,
-                        editable,
-                        start_time
-                    )
+                today_data = await get_pwwp_all_todays_schedule_content(
+                    session,
+                    batch_id,
+                    auth_headers,
+                    editable,
+                    start_time
                 )
 
-                with open(
-                    f"{clean_name}.txt",
-                    "w",
-                    encoding="utf-8"
-                ) as f:
-
+                with open(f"{clean_name}.txt", "w", encoding="utf-8") as f:
                     f.writelines(today_data)
 
             # ---------------------------------
             # UPLOAD
             # ---------------------------------
 
-            time_taken = format_time(
-                time.time() - start_time
-            )
-
+            time_taken = format_time(time.time() - start_time)
             caption = (
                 f"**Batch Name:** `{batch_name}`\n"
                 f"**Time Taken:** `{time_taken}`"
             )
 
-            await editable.edit(
-                "📤 **Uploading generated documents "
-                "to Telegram...**"
-            )
-
+            await editable.edit("📤 **Uploading generated documents to Telegram...**")
             uploaded_count = 0
 
-            for ext in [
-                "txt",
-                "zip",
-                "json"
-            ]:
+            for ext in ["txt", "zip", "json"]:
 
                 f_path = f"{clean_name}.{ext}"
 
-                if (
-                    os.path.exists(f_path)
-                    and os.path.getsize(f_path) > 0
-                ):
+                if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
 
                     try:
-
-                        with open(
-                            f_path,
-                            "rb"
-                        ) as doc:
-
+                        with open(f_path, "rb") as doc:
                             await m.reply_document(
                                 doc,
                                 caption=caption,
                                 file_name=f"{clean_name}.{ext}"
                             )
-
                         uploaded_count += 1
-
                     except Exception as upload_err:
-
-                        logging.error(
-                            "Failed to upload %s: %s",
-                            f_path,
-                            upload_err
-                        )
-
+                        logging.error("Failed to upload %s: %s", f_path, upload_err)
                     finally:
-
                         if os.path.exists(f_path):
-
                             os.remove(f_path)
 
                 elif os.path.exists(f_path):
-
                     os.remove(f_path)
 
             if uploaded_count == 0:
-
                 await editable.edit(
-                    "**Extraction completed, but no "
-                    "content or links were found. "
-                    "(0 Bytes output) ❌**"
+                    "**Extraction completed, but no content or links were found. (0 Bytes output) ❌**"
                 )
-
             else:
-
                 await editable.delete()
 
     except ProcessCancelledException:
 
         if clean_name:
-
-            for ext in [
-                "txt",
-                "zip",
-                "json"
-            ]:
-
+            for ext in ["txt", "zip", "json"]:
                 f_path = f"{clean_name}.{ext}"
-
                 if os.path.exists(f_path):
-
                     try:
                         os.remove(f_path)
                     except Exception:
@@ -1484,31 +1131,17 @@ async def process_pwwp(
 
     except Exception as e:
 
-        logging.exception(
-            "Error in process_pwwp:"
-        )
+        logging.exception("Error in process_pwwp:")
 
         try:
-
-            await editable.edit(
-                f"**Error : {e}**"
-            )
-
+            await editable.edit(f"**Error : {e}**")
         except Exception:
             pass
 
         if clean_name:
-
-            for ext in [
-                "txt",
-                "zip",
-                "json"
-            ]:
-
+            for ext in ["txt", "zip", "json"]:
                 f_path = f"{clean_name}.{ext}"
-
                 if os.path.exists(f_path):
-
                     try:
                         os.remove(f_path)
                     except Exception:
@@ -1517,16 +1150,10 @@ async def process_pwwp(
 
 def register_pwwp_handlers(bot: Client):
 
-    @bot.on_callback_query(
-        filters.regex("^pwwp$")
-    )
-    async def pwwp_callback(
-        client: Client,
-        callback_query
-    ):
+    @bot.on_callback_query(filters.regex("^pwwp$"))
+    async def pwwp_callback(client: Client, callback_query):
 
         user_id = callback_query.from_user.id
-
         await callback_query.answer()
 
         asyncio.create_task(
