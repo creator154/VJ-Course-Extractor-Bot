@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 import uuid
 import zipfile
@@ -14,7 +15,41 @@ from pyrogram.types import Message
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 
-SEMAPHORE = asyncio.Semaphore(10)
+# ---------------- RATE LIMIT SETTINGS (tune here) ----------------
+MAX_CONCURRENCY = 4          # parallel requests at a time
+MIN_REQUEST_INTERVAL = 0.25  # min seconds between any two requests (~4 req/s)
+MAX_RETRIES = 6              # retries per request
+BASE_BACKOFF = 2.0           # exponential backoff base (seconds)
+MAX_BACKOFF = 60.0           # cap for a single wait
+# -----------------------------------------------------------------
+
+SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
+
+
+class RateLimiter:
+    """Global limiter: spaces out requests and supports a shared cooldown
+    when the server answers 429, so ALL tasks slow down together."""
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._next_slot = 0.0
+        self._pause_until = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_slot, self._pause_until)
+            self._next_slot = start + self.min_interval
+        delay = start - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def pause(self, seconds: float):
+        self._pause_until = max(self._pause_until, time.monotonic() + seconds)
+
+
+RATE_LIMITER = RateLimiter(MIN_REQUEST_INTERVAL)
 
 # User response tracking dictionary for built-in ask_user
 USER_RESPONSES: Dict[int, str] = {}
@@ -40,7 +75,6 @@ def extract_url_from_video_details(item: Dict) -> str:
     if not item or not isinstance(item, dict):
         return ""
 
-    # Check videoDetails object
     vd = item.get("videoDetails", {}) or {}
     if vd:
         url = (
@@ -53,7 +87,6 @@ def extract_url_from_video_details(item: Dict) -> str:
         if url:
             return url
 
-    # Direct URL check
     direct_url = item.get("url") or item.get("videoUrl") or ""
     return direct_url
 
@@ -142,6 +175,25 @@ async def update_status_card(
         pass
 
 
+def _backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Server's Retry-After wins; otherwise exponential backoff + jitter."""
+    if retry_after is not None and retry_after > 0:
+        delay = retry_after
+    else:
+        delay = BASE_BACKOFF * (2 ** attempt)
+    delay = min(delay, MAX_BACKOFF)
+    return delay + random.uniform(0, 1)
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 async def fetch_pwwp_data(
     session: aiohttp.ClientSession,
     url: str,
@@ -150,53 +202,77 @@ async def fetch_pwwp_data(
     data: Dict = None,
     method: str = "GET"
 ) -> Any:
+    """Request with global throttling, 429 handling and backoff.
+    The semaphore is held only during the request itself, never while sleeping."""
 
-    async with SEMAPHORE:
-        for attempt in range(3):
-            try:
+    for attempt in range(MAX_RETRIES):
+        wait_for = 0.0  # >0 means: retry after sleeping this long
+
+        try:
+            async with SEMAPHORE:
+                await RATE_LIMITER.wait()
+
                 async with session.request(
                     method, url, headers=headers, params=params, json=data
                 ) as response:
+                    status = response.status
                     response_body = await response.text()
+                    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
 
-                    logging.info(
-                        "PWWP API | method=%s | status=%s | endpoint=%s",
-                        method, response.status, url
-                    )
+            logging.info(
+                "PWWP API | method=%s | status=%s | endpoint=%s",
+                method, status, url
+            )
 
-                    if response.status == 401:
-                        logging.error("PWWP AUTH FAILED | endpoint=%s", url)
-                        return {
-                            "_auth_error": True,
-                            "_status": 401,
-                            "_response": response_body
-                        }
+            if status == 401:
+                logging.error("PWWP AUTH FAILED | endpoint=%s", url)
+                return {
+                    "_auth_error": True,
+                    "_status": 401,
+                    "_response": response_body
+                }
 
-                    if response.status >= 400:
-                        logging.error(
-                            "PWWP API ERROR | attempt=%s | status=%s | endpoint=%s",
-                            attempt + 1, response.status, url
-                        )
-                        if attempt < 2:
-                            await asyncio.sleep(2 ** attempt)
-                        continue
+            if status in (429, 503):
+                wait_for = _backoff_delay(attempt, retry_after)
+                RATE_LIMITER.pause(wait_for)  # slow down ALL tasks
+                logging.warning(
+                    "PWWP RATE LIMITED | status=%s | attempt=%s | waiting %.1fs | endpoint=%s",
+                    status, attempt + 1, wait_for, url
+                )
 
-                    try:
-                        return json.loads(response_body)
-                    except json.JSONDecodeError:
-                        return None
+            elif status >= 500:
+                wait_for = _backoff_delay(attempt)
+                logging.error(
+                    "PWWP SERVER ERROR | attempt=%s | status=%s | endpoint=%s",
+                    attempt + 1, status, url
+                )
 
-            except asyncio.TimeoutError:
-                logging.error("PWWP TIMEOUT | attempt=%s | endpoint=%s", attempt + 1, url)
-            except aiohttp.ClientError as e:
-                logging.error("PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s", attempt + 1, url, str(e))
-            except Exception:
-                logging.exception("PWWP UNEXPECTED ERROR | endpoint=%s", url)
+            elif status >= 400:
+                # 403/404 etc. will not fix themselves, don't hammer the API
+                logging.error("PWWP CLIENT ERROR | status=%s | endpoint=%s", status, url)
+                return None
 
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
+            else:
+                try:
+                    return json.loads(response_body)
+                except json.JSONDecodeError:
+                    return None
 
-        return None
+        except asyncio.TimeoutError:
+            logging.error("PWWP TIMEOUT | attempt=%s | endpoint=%s", attempt + 1, url)
+            wait_for = _backoff_delay(attempt)
+        except aiohttp.ClientError as e:
+            logging.error("PWWP NETWORK ERROR | attempt=%s | endpoint=%s | error=%s", attempt + 1, url, str(e))
+            wait_for = _backoff_delay(attempt)
+        except Exception:
+            logging.exception("PWWP UNEXPECTED ERROR | endpoint=%s", url)
+            wait_for = _backoff_delay(attempt)
+
+        if attempt < MAX_RETRIES - 1 and wait_for > 0:
+            await asyncio.sleep(wait_for)
+
+    logging.error("PWWP GAVE UP after %s attempts | endpoint=%s", MAX_RETRIES, url)
+    return None
 
 
 async def process_pwwp_chapter_content(
@@ -227,9 +303,8 @@ async def process_pwwp_chapter_content(
             if video_url:
                 content.append(f"{topic}:{video_url}")
 
-        # 2. Notes / PDFs extraction (New API Response structure support)
+        # 2. Notes / PDFs extraction
         if content_type in ("notes", "dppNotes", "DppNotes", "videos", "dppVideos"):
-            # Direct attachments
             for att in item.get("attachments", []) or []:
                 u = att.get("url") or att.get("fileUrl") or (
                     (att.get("baseUrl") or "") + (att.get("key") or "")
@@ -237,7 +312,6 @@ async def process_pwwp_chapter_content(
                 if u:
                     content.append(f"{topic}:{u}")
 
-            # Homework / DPP attachments
             for hw in item.get("homeworkIds", []) or []:
                 hw_topic = hw.get("topic", topic)
                 for att in (hw.get("attachmentIds", []) or hw.get("attachments", []) or []):
@@ -268,7 +342,6 @@ async def fetch_pwwp_all_schedule(
             f"{selected_batch_id}/subject/{subject_id}/contents"
         )
 
-        # FIXED: 'tag' replaced with 'topicId' as per latest PW API update
         params = {
             "topicId": chapter_id,
             "contentType": content_type,
@@ -402,15 +475,23 @@ async def process_pwwp_subject(
     if not chapters:
         return
 
-    results = await asyncio.gather(
-        *[
-            process_pwwp_chapters(
-                session, ch["_id"], selected_batch_id, subject_id, headers, allowed_content_types
-            )
-            for ch in chapters
-        ],
-        return_exceptions=True
-    )
+    # Chapters are processed in small groups instead of all at once,
+    # so we don't queue thousands of requests in one burst.
+    CHAPTER_BATCH = 3
+    results: List[Any] = []
+
+    for i in range(0, len(chapters), CHAPTER_BATCH):
+        group = chapters[i:i + CHAPTER_BATCH]
+        group_results = await asyncio.gather(
+            *[
+                process_pwwp_chapters(
+                    session, ch["_id"], selected_batch_id, subject_id, headers, allowed_content_types
+                )
+                for ch in group
+            ],
+            return_exceptions=True
+        )
+        results.extend(group_results)
 
     all_urls = []
 
@@ -482,6 +563,9 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                     headers={**api_headers, "randomid": str(uuid.uuid4())},
                     json=otp_payload
                 ) as resp:
+                    if resp.status == 429:
+                        await editable.edit("**Too many OTP requests ⏳ Please wait a few minutes and try again.**")
+                        return
                     if resp.status >= 400:
                         await editable.edit("**OTP Request Failed ❌**")
                         return
@@ -508,6 +592,9 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                     headers={**api_headers, "randomid": str(uuid.uuid4())},
                     json=token_payload
                 ) as resp:
+                    if resp.status == 429:
+                        await editable.edit("**Too many attempts ⏳ Please wait a few minutes and try again.**")
+                        return
                     if resp.status >= 400:
                         await editable.edit("**Login Failed ❌**")
                         return
@@ -581,7 +668,6 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
             batch_data = b_details.get("data", {}) if b_details else {}
             is_purchased = batch_data.get("isPurchased", False) or batch_data.get("isEnrolled", False)
 
-            # Define Allowed Content Types based on Subscription
             if is_purchased:
                 token_mode_str = "💎 **PAID TOKEN DETECTED**\nExtracting: **Videos + Notes + DPPs**"
                 allowed_content_types = ["videos", "notes", "dppNotes", "dppVideos"]
@@ -633,7 +719,6 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                 activity="Compiling final files..."
             )
 
-            # Write JSON & TXT files
             with open(f"{clean_name}.json", "w", encoding="utf-8") as f:
                 json.dump(json_data, f, indent=4, ensure_ascii=False)
 
