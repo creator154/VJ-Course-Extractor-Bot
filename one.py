@@ -1521,5 +1521,3 @@ def register_pwwp_handlers(bot: Client):
                 user_id
             )
         )
-
-Kuch download nhinhonrha h notes wagira PW ki api change Hui h ky?
