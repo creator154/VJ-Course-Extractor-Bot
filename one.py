@@ -637,100 +637,59 @@ async def process_pwwp_subject(
     ] = all_urls
 
 
-async def get_pwwp_todays_schedule_content_details(
-    session: aiohttp.ClientSession,
-    selected_batch_id: str,
-    subject_id: str,
-    schedule_id: str,
-    headers: Dict
-) -> List[str]:
+async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSession, selected_batch_id, subject_id, schedule_id, headers: Dict) -> List[str]:
 
-    url = (
-        f"https://api.penpencil.co/v1/batches/"
-        f"{selected_batch_id}/subject/{subject_id}/schedule/"
-        f"{schedule_id}/schedule-details"
-    )
-
-    data = await fetch_pwwp_data(
-        session,
-        url,
-        headers=headers
-    )
-
+    url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+    data = await fetch_pwwp_data(session, url, headers)
     content = []
 
-    if (
-        data
-        and not data.get("_auth_error")
-        and data.get("success")
-        and data.get("data")
-    ):
-
-        item = data["data"]
-
-        name = item.get(
-            "topic",
-            ""
-        )
-
-        v_url = extract_url_from_video_details(
-            item
-        )
-
-        if v_url:
-
-            content.append(
-                f"{name}:{v_url}\n"
-            )
-
-        else:
-
-            for hw in item.get(
-                "homeworkIds",
-                []
-            ) or []:
-
-                for att in hw.get(
-                    "attachmentIds",
-                    []
-                ) or []:
-
-                    u = (
-                        att.get("baseUrl", "") +
-                        att.get("key", "")
-                    )
-
-                    if u and not u.endswith(".pdf"):
-
-                        content.append(
-                            f"{hw.get('topic', name)}:{u}\n"
-                        )
-
-        for hw in (
-            item.get("dpp") or {}
-        ).get(
-            "homeworkIds",
-            []
-        ) or []:
-
-            for att in hw.get(
-                "attachmentIds",
-                []
-            ) or []:
-
-                u = (
-                    att.get("baseUrl", "") +
-                    att.get("key", "")
-                )
-
-                if u:
-
-                    content.append(
-                        f"{hw.get('topic', name)}:{u}\n"
-                    )
-
+    if data and data.get("success") and data.get("data"):
+        data_item = data["data"]
+        
+        video_details = data_item.get('videoDetails', {})
+        if video_details:
+            name = data_item.get('topic')
+            
+            videoUrl = video_details.get('videoUrl') or video_details.get('embedCode')
+            image = video_details.get('image')
+                
+            if videoUrl:
+                line = f"{name}:{videoUrl}?childId={schedule_id}&parentId={selected_batch_id}\n"
+                content.append(line)
+           #     logging.info(line)
+               
+                          
+        homework_ids = data_item.get('homeworkIds')
+        for homework in homework_ids:
+            attachment_ids = homework.get('attachmentIds')
+            name = homework.get('topic')
+            for attachment in attachment_ids:
+            
+                url = attachment.get('baseUrl', '') + attachment.get('key', '')
+                        
+                if url:
+                    line = f"{name}:{url}\n"
+                    content.append(line)
+                #    logging.info(line)
+                
+        dpp = data_item.get('dpp')
+        if dpp:
+            dpp_homework_ids = dpp.get('homeworkIds')
+            for homework in dpp_homework_ids:
+                attachment_ids = homework.get('attachmentIds')
+                name = homework.get('topic')
+                for attachment in attachment_ids:
+                
+                    url = attachment.get('baseUrl', '') + attachment.get('key', '')
+                        
+                    if url:
+                        line = f"{name}:{url}\n"
+                        content.append(line)
+                    #    logging.info(line)
+    else:
+        logging.warning(f"No Data Found For  Id - {schedule_id}")
     return content
-
+    
 
 async def get_pwwp_all_todays_schedule_content(
     session: aiohttp.ClientSession,
