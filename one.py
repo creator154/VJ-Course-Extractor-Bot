@@ -222,7 +222,8 @@ async def process_pwwp_chapter_content(
     subject_id: str,
     schedule_id: str,
     content_type: str,
-    headers: Dict
+    headers: Dict,
+    is_solution: bool = False
 ) -> Dict[str, List[str]]:
 
     url = (
@@ -238,6 +239,7 @@ async def process_pwwp_chapter_content(
     )
 
     content = []
+    target_type = content_type
 
     if (
         data
@@ -254,6 +256,8 @@ async def process_pwwp_chapter_content(
             video_url = extract_url_from_video_details(item)
 
             if video_url:
+                if is_solution:
+                    target_type = "dpp_solutions"
 
                 content.append(
                     f"{topic}:{video_url}"
@@ -298,7 +302,7 @@ async def process_pwwp_chapter_content(
                         )
 
     return (
-        {content_type: content}
+        {target_type: content}
         if content
         else {}
     )
@@ -411,15 +415,24 @@ async def process_pwwp_chapters(
 
         sid = item["_id"]
         ct = item["content_type"]
+        topic = item.get("topic", "")
+        topic_lower = topic.lower()
+
+        # Strict keyword check for solution videos (No PDFs/Notes)
+        is_solution_video = any(
+            keyword in topic_lower 
+            for keyword in ["solution", "discussion", "sol."]
+        )
 
         if (
             ct in ("videos", "DppVideos")
             and item.get("_pre_extracted_url")
         ):
+            target_ct = "dpp_solutions" if is_solution_video else ct
 
             async def _direct(
-                c_type=ct,
-                name=item.get("topic", sid),
+                c_type=target_ct,
+                name=topic or sid,
                 url=item["_pre_extracted_url"]
             ):
                 return {
@@ -439,7 +452,8 @@ async def process_pwwp_chapters(
                     subject_id,
                     sid,
                     ct,
-                    headers
+                    headers,
+                    is_solution=is_solution_video if ct in ("videos", "DppVideos") else False
                 )
             )
 
@@ -608,7 +622,8 @@ async def process_pwwp_subject(
             "videos",
             "notes",
             "DppNotes",
-            "DppVideos"
+            "DppVideos",
+            "dpp_solutions"
         ]:
 
             if content_map.get(c_type):
@@ -656,7 +671,6 @@ async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSessio
             if videoUrl:
                 line = f"{name}:{videoUrl}?childId={schedule_id}&parentId={selected_batch_id}\n"
                 content.append(line)
-           #     logging.info(line)
                
                           
         homework_ids = data_item.get('homeworkIds')
@@ -670,7 +684,6 @@ async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSessio
                 if url:
                     line = f"{name}:{url}\n"
                     content.append(line)
-                #    logging.info(line)
                 
         dpp = data_item.get('dpp')
         if dpp:
@@ -685,7 +698,6 @@ async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSessio
                     if url:
                         line = f"{name}:{url}\n"
                         content.append(line)
-                    #    logging.info(line)
     else:
         logging.warning(f"No Data Found For  Id - {schedule_id}")
     return content
@@ -1164,10 +1176,6 @@ async def process_pwwp(
                     )
                 )
 
-                # Date selection is complete here.
-                # Continue only with your authorized
-                # date-based API/data handling.
-
                 return
 
             start_time = time.time()
@@ -1461,17 +1469,6 @@ def register_pwwp_handlers(bot: Client):
         user_id = callback_query.from_user.id
 
         await callback_query.answer()
-
-        # Authorization check intentionally remains
-        # disabled as in your original code.
-        #
-        # if not is_authorized(user_id):
-        #     await client.send_message(
-        #         callback_query.message.chat.id,
-        #         "**You Are Not Subscribed To This Bot.\n"
-        #         "Contact Owner.**"
-        #     )
-        #     return
 
         asyncio.create_task(
             process_pwwp(
