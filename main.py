@@ -89,7 +89,7 @@ START_KEYBOARD = InlineKeyboardMarkup([
     [
         InlineKeyboardButton(
             "👨‍💻 𝗗𝗲𝘃𝗲𝗹𝗼𝗽𝗲𝗿 🇮🇳",
-            url="https://t.me/SumitTripathi"
+            url="https://t.me/HeySumit"
         )
     ],
     [
