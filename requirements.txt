@@ -1,4 +1,7 @@
-kurigram
+
+pyrogram==2.0.106
+TgCrypto
+pyromod==3.1.6
 requests
 cloudscraper
 beautifulsoup4==4.12.2
@@ -16,4 +19,3 @@ soupsieve==2.5
 python-decouple==3.8
 Flask==3.0.3
 gunicorn==22.0.0
-pyromod==3.1.6
