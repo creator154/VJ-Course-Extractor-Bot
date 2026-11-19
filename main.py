@@ -156,4 +156,5 @@ register_appxwp_handlers(bot)
 # =========================================================
 
 if __name__ == "__main__":
+    logging.info("Starting Zx Extractor Bot...")
     bot.run()
